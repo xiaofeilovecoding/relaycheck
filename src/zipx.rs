@@ -269,6 +269,27 @@ pub fn unpack_package(
         entries.push((name, buf, is_symlink));
     }
 
+    // RC03: EVERY entry is secret-scanned before anything is parsed,
+    // persisted or shown — a receipt/markdown/manifest/source carrying
+    // high-confidence secret material fails the WHOLE package (no partial
+    // activation), and the error names the entry without echoing the secret.
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, data, _) in &entries {
+        if crate::secrets::scan_bytes(data).is_some() {
+            offenders.push(name.clone());
+            if offenders.len() >= 20 {
+                break;
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        return Err(RelayError::new(
+            Code::ESecretDetected,
+            "package contains high-confidence secret material; import blocked",
+        )
+        .with_details(offenders));
+    }
+
     let receipt_entry = entries.iter().find(|(n, _, _)| n == "receipt.json");
     let manifest_entry = entries.iter().find(|(n, _, _)| n == "manifest.json");
     let Some((_, receipt_raw, _)) = receipt_entry else {

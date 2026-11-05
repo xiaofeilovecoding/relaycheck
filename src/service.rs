@@ -171,6 +171,7 @@ pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
     } else {
         vec!["-c".into(), "exit 0".into()]
     };
+    let demo_rev = ctx.store.task_int(&task_id, "revision")?;
     let profile = save_profile(
         ctx,
         &task_id,
@@ -185,10 +186,12 @@ pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
         }],
         vec![],
         vec![],
+        demo_rev,
     )?;
     ctx.store.set_profile_trusted(&profile.id, true)?;
     // Demo attestation: the service created this empty repo itself; no
     // external tool could be writing it (documented in the UI copy).
+    let cap_rev = ctx.store.task_int(&task_id, "revision")?;
     run_capture(
         ctx,
         &CaptureRequest {
@@ -196,6 +199,7 @@ pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
             untracked_selected: vec![],
             extra_excludes: vec![],
             attest_stopped: true,
+            expected_revision: cap_rev,
         },
         "demo-capture",
     )?;
@@ -290,6 +294,10 @@ pub struct CaptureRequest {
     pub untracked_selected: Vec<String>,
     pub extra_excludes: Vec<String>,
     pub attest_stopped: bool,
+    /// RC01: capture may only activate a candidate from the revision the
+    /// caller saw (CAS is checked at request time; re-checked here so the
+    /// worker cannot race a profile/revision bump between request and run).
+    pub expected_revision: i64,
 }
 
 #[derive(Debug)]
@@ -311,6 +319,16 @@ pub fn plan_capture(ctx: &Ctx, task_id: &str, untracked_selected: &[String], ext
 /// Runs the capture synchronously (caller holds the write slot).
 pub fn run_capture(ctx: &Ctx, req: &CaptureRequest, op_id: &str) -> RelayResult<CaptureResult> {
     let task_id = &req.task_id;
+    let rev = ctx.store.task_int(task_id, "revision")?;
+    if rev != req.expected_revision {
+        return Err(RelayError::new(
+            Code::ERevisionConflict,
+            format!(
+                "capture was approved at revision {}, but the task is at revision {}",
+                req.expected_revision, rev
+            ),
+        ));
+    }
     if !req.attest_stopped {
         return Err(RelayError::validation(
             "confirm the original tool has stopped writing before capturing (user attestation required)",
@@ -435,7 +453,18 @@ pub fn save_profile(
     checks: Vec<CheckStep>,
     prep: Vec<PrepStep>,
     outputs: Vec<String>,
+    if_match: i64,
 ) -> RelayResult<CheckProfile> {
+    // RC01: saving a profile is a task mutation — CAS on the revision the
+    // user actually saw, so two tabs cannot silently replace each other's
+    // profile (the loser gets E_REVISION_CONFLICT and re-reads).
+    let rev = ctx.store.task_int(task_id, "revision")?;
+    if rev != if_match {
+        return Err(RelayError::new(
+            Code::ERevisionConflict,
+            format!("If-Match revision {if_match} does not match current task revision {rev}"),
+        ));
+    }
     // Validate against the current snapshot inputs when one exists.
     let active = ctx
         .store
@@ -474,6 +503,11 @@ pub fn save_profile(
 pub struct VerifyRequest {
     pub task_id: String,
     pub trust_confirmed: bool,
+    /// RC01: the profile the user actually reviewed and approved. The run is
+    /// refused unless these match the task's CURRENT profile identity.
+    pub profile_id: String,
+    pub profile_hash: String,
+    pub if_match: i64,
 }
 
 #[derive(Debug)]
@@ -492,14 +526,41 @@ pub fn run_verify(ctx: &Ctx, req: &VerifyRequest, cancel: &checks::CancelFlag, o
             "checks run your local code; review the repository and command first, then approve",
         ));
     }
-    // The explicit confirmation IS the approval act (spec §5: 保存并明确批准才可执行).
-    // Mark the current profile revision trusted so this and later rounds run.
-    let pre_id = ctx
+    // RC01: the approval binds to the exact profile identity the user
+    // previewed and to the task revision they saw. Nothing is marked trusted
+    // until every check passes; stale or mismatched approvals are refused
+    // outright so an unreviewed profile can never execute.
+    let rev = ctx.store.task_int(task_id, "revision")?;
+    if rev != req.if_match {
+        return Err(RelayError::new(
+            Code::ERevisionConflict,
+            format!(
+                "approval was given for revision {}, but the task is at revision {}",
+                req.if_match, rev
+            ),
+        ));
+    }
+    let current_profile_id = ctx
         .store
         .task_field_opt(task_id, "profile_id")?
         .unwrap_or_default();
-    if !pre_id.is_empty() {
-        ctx.store.set_profile_trusted(&pre_id, true)?;
+    if current_profile_id.is_empty() {
+        return Err(RelayError::state("save and approve a check profile first"));
+    }
+    if req.profile_id != current_profile_id {
+        return Err(RelayError::new(
+            Code::EProfileChanged,
+            "approval references a different profile than the task's current one",
+        )
+        .with_details(vec![format!("approved_profile={}", req.profile_id)]));
+    }
+    let profile = ctx.store.profile_json(&current_profile_id)?;
+    if profile.hash != req.profile_hash {
+        return Err(RelayError::new(
+            Code::EProfileChanged,
+            "approved profile hash does not match the current profile content",
+        )
+        .with_details(vec![format!("approved_hash={}", &req.profile_hash[..12.min(req.profile_hash.len())])]));
     }
     let active = ctx
         .store
@@ -508,20 +569,9 @@ pub fn run_verify(ctx: &Ctx, req: &VerifyRequest, cancel: &checks::CancelFlag, o
     if active.is_empty() {
         return Err(RelayError::state("capture a candidate before running checks"));
     }
-    let profile_id = ctx
-        .store
-        .task_field_opt(task_id, "profile_id")?
-        .unwrap_or_default();
-    if profile_id.is_empty() {
-        return Err(RelayError::state("save and approve a check profile first"));
-    }
-    if !ctx.store.profile_trusted(&profile_id)? {
-        return Err(RelayError::new(
-            Code::EProfileUntrusted,
-            "profile has not been approved for execution",
-        ));
-    }
-    let profile = ctx.store.profile_json(&profile_id)?;
+    // The explicit, identity-bound confirmation IS the approval act
+    // (spec §5: 保存并明确批准才可执行).
+    ctx.store.set_profile_trusted(&current_profile_id, true)?;
     let files: Vec<(String, String)> = ctx
         .store
         .snapshot_files(&active)?
@@ -545,7 +595,7 @@ pub fn run_verify(ctx: &Ctx, req: &VerifyRequest, cancel: &checks::CancelFlag, o
     let _ = ctx.store.append_event("task.checking", &serde_json::json!({ "task_id": task_id }));
 
     let round = checks::run_round(
-        task_id, &active, &profile, &profile_id, rev, epoch, cepoch, &files, &ctx.blobs,
+        task_id, &active, &profile, &current_profile_id, rev, epoch, cepoch, &files, &ctx.blobs,
         &ctx.tmp_root, cancel, notify,
     );
     let round = match round {
@@ -556,7 +606,7 @@ pub fn run_verify(ctx: &Ctx, req: &VerifyRequest, cancel: &checks::CancelFlag, o
             return Err(e);
         }
     };
-    ctx.store.insert_verification(&round.record, &profile_id)?;
+    ctx.store.insert_verification(&round.record, &current_profile_id)?;
     let new_state = match round.record.round_status.as_str() {
         "passed" => {
             let has_required = profile.checks.iter().any(|c| c.required);

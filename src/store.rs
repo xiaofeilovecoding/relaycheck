@@ -1081,6 +1081,24 @@ impl Store {
         Ok(row)
     }
 
+    /// RC09: full operation row for an idempotency key — the replay path
+    /// survives restarts because it reads the DB, not a memory cache.
+    pub fn operation_by_key(&self, key: &str) -> RelayResult<Option<serde_json::Value>> {
+        let conn = self.lock();
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM operations WHERE idempotency_key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        drop(conn);
+        match id {
+            Some(id) => Ok(Some(self.operation_state(&id)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Operations that looked active when the process died are marked
     /// interrupted at startup — never auto-rerun (spec §5).
     pub fn mark_stale_running_interrupted(&self) -> RelayResult<usize> {

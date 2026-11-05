@@ -91,24 +91,11 @@ fn cmd_serve(args: &[String]) -> i32 {
 }
 
 fn serve_inner(data_dir: PathBuf, port_override: Option<u16>) -> RelayResult<()> {
-    let store = Arc::new(Store::open(&data_dir)?);
-    let blobs = Arc::new(relaycheck::blobstore::BlobStore::new(&data_dir)?);
-    let ops = Arc::new(OpManager::new());
-    let recovered = ops.recover_stale(&store)?;
-    if recovered > 0 {
-        eprintln!("[relaycheck] marked {recovered} unfinished operation(s) interrupted after restart; nothing was rerun");
-    }
-    let ctx = Ctx {
-        store: store.clone(),
-        blobs,
-        ops,
-        tmp_root: data_dir.join("tmp"),
-        isolated_home: data_dir.join("isolated-home"),
-    };
-    std::fs::create_dir_all(&ctx.tmp_root)?;
-    std::fs::create_dir_all(&ctx.isolated_home)?;
-
-    // Single instance lock (share_mode 0 → sharing violation when held).
+    // RC02: the single-instance lock MUST be taken before anything touches
+    // the database — a second launcher opening the same data dir used to
+    // mark the first instance's running operations interrupted even though
+    // it then exited. Directory creation itself is side-effect-free.
+    std::fs::create_dir_all(&data_dir)?;
     let lock_path = data_dir.join("instance.lock");
     let _lock: std::fs::File = {
         #[cfg(windows)]
@@ -131,6 +118,23 @@ fn serve_inner(data_dir: PathBuf, port_override: Option<u16>) -> RelayResult<()>
             std::fs::OpenOptions::new().create(true).write(true).open(&lock_path)?
         }
     };
+
+    let store = Arc::new(Store::open(&data_dir)?);
+    let blobs = Arc::new(relaycheck::blobstore::BlobStore::new(&data_dir)?);
+    let ops = Arc::new(OpManager::new());
+    let recovered = ops.recover_stale(&store)?;
+    if recovered > 0 {
+        eprintln!("[relaycheck] marked {recovered} unfinished operation(s) interrupted after restart; nothing was rerun");
+    }
+    let ctx = Ctx {
+        store: store.clone(),
+        blobs,
+        ops,
+        tmp_root: data_dir.join("tmp"),
+        isolated_home: data_dir.join("isolated-home"),
+    };
+    std::fs::create_dir_all(&ctx.tmp_root)?;
+    std::fs::create_dir_all(&ctx.isolated_home)?;
 
     let cli_token = read_or_create_cli_token(&data_dir)?;
     let (tx, _rx) = tokio::sync::broadcast::channel::<i64>(256);

@@ -43,10 +43,17 @@ fn r07_cancel_running_check_kills_process_tree() {
     let ctx = env.ctx.clone();
     let t_task = task_id.clone();
     let cancel2 = cancel.clone();
+    let (pid, phash, rev) = profile_identity(&env, &task_id);
     let worker = std::thread::spawn(move || {
         relaycheck::service::run_verify(
             &ctx,
-            &relaycheck::service::VerifyRequest { task_id: t_task, trust_confirmed: true },
+            &relaycheck::service::VerifyRequest {
+                task_id: t_task.clone(),
+                trust_confirmed: true,
+                profile_id: pid,
+                profile_hash: phash,
+                if_match: rev,
+            },
             &cancel2,
             op_id,
             |_| {},
@@ -182,6 +189,7 @@ fn r07_timeout_interrupts_without_failing_assertions() {
         }],
         vec![],
         vec![],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap();
     env.ctx.store.set_profile_trusted(&profile.id, true).unwrap();

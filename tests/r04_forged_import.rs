@@ -205,6 +205,7 @@ fn r04_empty_required_profile_never_ready_or_accepted() {
         }],
         vec![],
         vec![],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap();
     env.ctx.store.set_profile_trusted(&profile.id, true).unwrap();

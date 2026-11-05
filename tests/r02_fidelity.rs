@@ -33,6 +33,7 @@ fn r02_byte_fidelity_through_full_chain() {
             untracked_selected: vec!["notes/untracked 选择.md".into()],
             extra_excludes: vec![],
             attest_stopped: true,
+            expected_revision: env.ctx.store.task_int(&task_id, "revision").unwrap(),
         },
         op_id,
     );
@@ -109,6 +110,7 @@ fn r02_limits_and_exclusions_are_explicit() {
             untracked_selected: vec![],
             extra_excludes: vec!["big.bin".into()],
             attest_stopped: true,
+            expected_revision: env.ctx.store.task_int(&task_id, "revision").unwrap(),
         },
         op_id,
     );

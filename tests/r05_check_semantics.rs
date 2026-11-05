@@ -60,6 +60,7 @@ fn r05_missing_dependency_is_blocked_not_failed() {
         }],
         vec![],
         vec![],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap();
     env.ctx.store.set_profile_trusted(&profile.id, true).unwrap();
@@ -133,6 +134,7 @@ sys.exit(0)
         }],
         vec![],
         vec!["build".into()],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap();
     env.ctx.store.set_profile_trusted(&profile.id, true).unwrap();
@@ -162,6 +164,7 @@ sys.exit(0)
         }],
         vec![],
         vec![],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap();
     env.ctx.store.set_profile_trusted(&profile2.id, true).unwrap();
@@ -253,6 +256,7 @@ fn r05_profile_validation_rejects_scripts_and_relative_exe() {
         }],
         vec![],
         vec![],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap_err();
     assert!(err.message.contains("refusing to execute"), "msg: {}", err.message);
@@ -271,6 +275,7 @@ fn r05_profile_validation_rejects_scripts_and_relative_exe() {
         }],
         vec![],
         vec![],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap_err();
     assert!(err.message.contains("absolute path"), "msg: {}", err.message);
@@ -290,6 +295,7 @@ fn r05_profile_validation_rejects_scripts_and_relative_exe() {
         }],
         vec![],
         vec!["a.txt".into()],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap_err();
     assert!(err.message.contains("must not cover source"), "msg: {}", err.message);

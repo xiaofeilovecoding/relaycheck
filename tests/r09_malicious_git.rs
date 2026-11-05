@@ -104,6 +104,7 @@ fn r09_corrupt_blob_bars_checks_and_acceptance() {
         }],
         vec![],
         vec![],
+        env.ctx.store.task_int(&task_id, "revision").unwrap(),
     )
     .unwrap();
     env.ctx.store.set_profile_trusted(&profile0.id, true).unwrap();
@@ -129,7 +130,16 @@ fn r09_corrupt_blob_bars_checks_and_acceptance() {
     let cancel = env.ctx.ops.begin(op_id, "verify").unwrap();
     let result = service::run_verify(
         &env.ctx,
-        &service::VerifyRequest { task_id: task_id.clone(), trust_confirmed: true },
+        &{
+            let (pid, phash, rev) = profile_identity(&env, &task_id);
+            service::VerifyRequest {
+                task_id: task_id.clone(),
+                trust_confirmed: true,
+                profile_id: pid,
+                profile_hash: phash,
+                if_match: rev,
+            }
+        },
         &cancel,
         op_id,
         |_| {},

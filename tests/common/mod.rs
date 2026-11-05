@@ -219,6 +219,7 @@ pub fn setup_python_profile(
     let python = find_python();
     let script_path = env.scratch.join(format!("script-{check_id}.py"));
     std::fs::write(&script_path, script).unwrap();
+    let rev = env.ctx.store.task_int(task_id, "revision").unwrap();
     let profile = relaycheck::service::save_profile(
         &env.ctx,
         task_id,
@@ -233,10 +234,28 @@ pub fn setup_python_profile(
         }],
         vec![],
         vec![],
+        rev,
     )
     .expect("save profile");
     env.ctx.store.set_profile_trusted(&profile.id, true).unwrap();
     profile.id
+}
+
+/// The profile identity a caller must present to run_verify (RC01).
+pub fn profile_identity(env: &TestEnv, task_id: &str) -> (String, String, i64) {
+    let pid = env
+        .ctx
+        .store
+        .task_field_opt(task_id, "profile_id")
+        .unwrap()
+        .unwrap_or_default();
+    let hash = if pid.is_empty() {
+        String::new()
+    } else {
+        env.ctx.store.profile_json(&pid).unwrap().hash
+    };
+    let rev = env.ctx.store.task_int(task_id, "revision").unwrap();
+    (pid, hash, rev)
 }
 
 /// Captures with default scope (all tracked files).
@@ -244,6 +263,7 @@ pub fn capture_all(env: &TestEnv, task_id: &str) -> relaycheck::errors::RelayRes
     let op_id = "test-capture-op";
     let _ = env.ctx.store.insert_operation(op_id, "capture", Some(task_id), None, "");
     let cancel = env.ctx.ops.begin(op_id, "capture").expect("begin capture");
+    let rev = env.ctx.store.task_int(task_id, "revision").unwrap();
     let result = relaycheck::service::run_capture(
         &env.ctx,
         &relaycheck::service::CaptureRequest {
@@ -251,6 +271,7 @@ pub fn capture_all(env: &TestEnv, task_id: &str) -> relaycheck::errors::RelayRes
             untracked_selected: vec![],
             extra_excludes: vec![],
             attest_stopped: true,
+            expected_revision: rev,
         },
         op_id,
     );
@@ -267,14 +288,21 @@ pub fn capture_all(env: &TestEnv, task_id: &str) -> relaycheck::errors::RelayRes
     result
 }
 
-/// Runs a verify round to completion.
+/// Runs a verify round to completion (identity bound, RC01).
 pub fn verify_now(env: &TestEnv, task_id: &str) -> relaycheck::service::VerifyResult {
+    let (pid, phash, rev) = profile_identity(env, task_id);
     let op_id = "test-verify-op";
     let _ = env.ctx.store.insert_operation(op_id, "verify", Some(task_id), None, "");
     let cancel = env.ctx.ops.begin(op_id, "verify").expect("begin verify");
     let result = relaycheck::service::run_verify(
         &env.ctx,
-        &relaycheck::service::VerifyRequest { task_id: task_id.to_string(), trust_confirmed: true },
+        &relaycheck::service::VerifyRequest {
+            task_id: task_id.to_string(),
+            trust_confirmed: true,
+            profile_id: pid,
+            profile_hash: phash,
+            if_match: rev,
+        },
         &cancel,
         op_id,
         |_| {},
@@ -333,3 +361,5 @@ pub fn export_handoff(
     assert_eq!(relaycheck::ids::sha256_hex(&bytes), sha);
     (handoff_id, sha, bytes)
 }
+
+pub mod http;

@@ -163,6 +163,11 @@ fn if_match_revision(headers: &HeaderMap) -> RelayResult<i64> {
     v.trim().parse::<i64>().map_err(|_| RelayError::validation("If-Match must be the task revision number"))
 }
 
+/// Canonical JSON text of a request body (stable across key order).
+fn canonical_request(v: &serde_json::Value) -> RelayResult<Vec<u8>> {
+    crate::canonical::canonicalize(v)
+}
+
 fn digest_of(parts: &[&[u8]]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
@@ -173,30 +178,55 @@ fn digest_of(parts: &[&[u8]]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Checks/replays idempotent POSTs. Returns Some(response) for replay.
-fn idem_replay(
-    state: &ServerState,
-    key: &str,
-    digest: &str,
-) -> Option<serde_json::Value> {
-    let g = state.idem.lock().unwrap();
-    if let Some((stored_digest, response)) = g.get(key) {
-        if stored_digest == digest {
-            return Some(response.clone());
-        }
-        return Some(json!({
-            "error": {"code": "E_REQUEST_CONFLICT", "message": "same Idempotency-Key used with a different request body"}
-        }));
-    }
-    None
+/// RC09: idempotency lives in the operations table, not a memory cache, so
+/// replays survive restarts and the digest covers the full canonical request.
+/// Same key + same digest → replay the ORIGINAL operation (its current state
+/// incl. result); same key + different digest → conflict.
+enum IdemStart {
+    Fresh,
+    Replay(serde_json::Value),
+    Conflict,
 }
 
-fn idem_store(state: &ServerState, key: &str, digest: &str, response: &serde_json::Value) {
-    let mut g = state.idem.lock().unwrap();
-    if g.len() > 512 {
-        g.clear(); // bounded cache
+fn idem_start(state: &ServerState, key: &str, digest: &str) -> RelayResult<IdemStart> {
+    if let Some(op) = state.ctx.store.operation_by_key(key)? {
+        let stored = state
+            .ctx
+            .store
+            .find_operation_by_idempotency(key)?
+            .map(|(_, _, _, d)| d)
+            .unwrap_or_default();
+        if stored == digest {
+            // Lift the stored result to the top level so replays have the
+            // same shape as the original response.
+            let result = op.get("result").cloned().unwrap_or(serde_json::Value::Null);
+            return Ok(IdemStart::Replay(json!({
+                "operation": op,
+                "result": result,
+                "replayed": true,
+            })));
+        }
+        return Ok(IdemStart::Conflict);
     }
-    g.insert(key.to_string(), (digest.to_string(), response.clone()));
+    let _ = state;
+    Ok(IdemStart::Fresh)
+}
+
+/// Wraps a synchronous result into the operation row keyed for idempotency.
+fn sync_op_result(
+    state: &ServerState,
+    op_id: &str,
+    result: &serde_json::Value,
+) -> RelayResult<()> {
+    state
+        .ctx
+        .store
+        .update_operation(op_id, "completed", Some(&result.to_string()), None)
+}
+
+/// The replay envelope for an operation row (used by sync endpoints too).
+fn envelope_from_op(op: &serde_json::Value) -> serde_json::Value {
+    json!({"operation": op, "replayed": true})
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +317,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/cli/capture", post(cli_capture))
         .route("/v1/cli/verify", post(cli_verify))
         .route("/v1/cli/tasks", get(cli_tasks))
+        .route("/v1/cli/task/{id}", get(cli_task_detail))
         .fallback(fallback)
         .with_state(state)
 }
@@ -594,6 +625,11 @@ pub fn build_task_detail(state: &ServerState, task_id: &str) -> RelayResult<serd
 fn collect_task_snapshots(store: &Store, task_id: &str) -> RelayResult<Vec<serde_json::Value>> {
     // Snapshots referenced by this task's verifications/handoffs + active.
     let mut ids: Vec<String> = Vec::new();
+    if let Some(active) = store.task_field_opt(task_id, "active_snapshot")? {
+        if !active.is_empty() {
+            ids.push(active);
+        }
+    }
     for v in store.verifications_for_task(task_id)? {
         if !ids.contains(&v.snapshot_id) {
             ids.push(v.snapshot_id);
@@ -756,23 +792,44 @@ async fn capture_ep(
 ) -> ApiResult<Response> {
     check_host(&headers, &state)?;
     require_write(&headers, &state)?;
+    let if_match = if_match_revision(&headers)?;
     let Ok(axum::Json(body)) = body else {
         return Err(RelayError::validation("invalid JSON"));
     };
     if state.ctx.ops.any_active() {
         return Err(RelayError::new(Code::ELimit, "another capture/check/import job is active"));
     }
-    let digest = digest_of(&[task_id.as_bytes(), serde_json::to_vec(&body).unwrap_or_default().as_slice()]);
+    // CAS: the capture activates a candidate only from the revision the
+    // caller actually saw.
+    let rev = state.ctx.store.task_int(&task_id, "revision")?;
+    if rev != if_match {
+        return Err(RelayError::new(
+            Code::ERevisionConflict,
+            format!("If-Match revision {if_match} does not match current task revision {rev}"),
+        ));
+    }
+    let digest = digest_of(&[
+        b"capture",
+        task_id.as_bytes(),
+        serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+    ]);
     let idem = idempotency_key(&headers);
+    // RC09: replay FIRST (from the DB), then the busy check — a replayed
+    // request must succeed even while its original operation is queued.
     if let Some(k) = &idem {
-        if let Some(replay) = idem_replay(&state, k, &digest) {
-            return if replay.get("error").is_some() {
-                Err(RelayError::new(Code::ERequestConflict, "same Idempotency-Key with a different body"))
-            } else {
-                Ok(ok_json(replay))
-            };
+        match idem_start(&state, k, &digest)? {
+            IdemStart::Replay(env) => return Ok(ok_json(env)),
+            IdemStart::Conflict => {
+                return Err(RelayError::new(
+                    Code::ERequestConflict,
+                    "same Idempotency-Key used with a different request body",
+                ))
+            }
+            IdemStart::Fresh => {}
         }
     }
+    let st = state.clone();
+    let t = task_id.clone();
     let st = state.clone();
     let t = task_id.clone();
     let attest = body.attest_stopped;
@@ -785,6 +842,7 @@ async fn capture_ep(
             untracked_selected: untracked,
             extra_excludes: excludes,
             attest_stopped: attest,
+            expected_revision: if_match,
         }, op_id)
         .map(|r| json!({
             "snapshot_id": r.snapshot_id,
@@ -795,9 +853,6 @@ async fn capture_ep(
         }))
     })?;
     let envelope = json!({"operation": {"id": op_id, "kind": "capture", "state": "pending"}});
-    if let Some(k) = &idem_key {
-        idem_store(&state, k, &digest, &envelope);
-    }
     let _ = st.events_tx.send(head_seq(&state));
     Ok((StatusCode::ACCEPTED, axum::Json(envelope)).into_response())
 }
@@ -820,10 +875,11 @@ async fn save_profile_ep(
 ) -> ApiResult<Response> {
     check_host(&headers, &state)?;
     require_write(&headers, &state)?;
+    let if_match = if_match_revision(&headers)?;
     let Ok(axum::Json(body)) = body else {
         return Err(RelayError::validation("invalid JSON"));
     };
-    let profile = service::save_profile(&state.ctx, &task_id, &body.name, body.checks, body.prep, body.outputs)?;
+    let profile = service::save_profile(&state.ctx, &task_id, &body.name, body.checks, body.prep, body.outputs, if_match)?;
     let _ = state.events_tx.send(head_seq(&state));
     Ok(ok_json(json!({
         "operation": null,
@@ -835,6 +891,9 @@ async fn save_profile_ep(
 #[derive(serde::Serialize, serde::Deserialize)]
 struct VerifyBody {
     trust_confirmed: bool,
+    /// RC01: identity of the profile the user actually reviewed.
+    profile_id: String,
+    profile_hash: String,
 }
 
 async fn verify_ep(
@@ -848,27 +907,43 @@ async fn verify_ep(
     let Ok(axum::Json(body)) = body else {
         return Err(RelayError::validation("invalid JSON"));
     };
+    let if_match = if_match_revision(&headers)?;
     if state.ctx.ops.any_active() {
         return Err(RelayError::new(Code::ELimit, "another capture/check/import job is active"));
     }
-    let digest = digest_of(&[task_id.as_bytes(), body.trust_confirmed.to_string().as_bytes()]);
+    let digest = digest_of(&[
+        b"verify",
+        task_id.as_bytes(),
+        serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+    ]);
     let idem = idempotency_key(&headers);
     if let Some(k) = &idem {
-        if let Some(replay) = idem_replay(&state, k, &digest) {
-            return if replay.get("error").is_some() {
-                Err(RelayError::new(Code::ERequestConflict, "same Idempotency-Key with a different body"))
-            } else {
-                Ok(ok_json(replay))
-            };
+        match idem_start(&state, k, &digest)? {
+            IdemStart::Replay(env) => return Ok(ok_json(env)),
+            IdemStart::Conflict => {
+                return Err(RelayError::new(
+                    Code::ERequestConflict,
+                    "same Idempotency-Key used with a different request body",
+                ))
+            }
+            IdemStart::Fresh => {}
         }
     }
     let t = task_id.clone();
     let trust = body.trust_confirmed;
+    let pid = body.profile_id;
+    let phash = body.profile_hash;
     let idem_key = idem.clone();
     let op_id = spawn_operation(&state, "verify", Some(&task_id), idem, &digest, move |ctx, op_id, cancel| {
         let store = ctx.store.clone();
         let t_step = t.clone();
-        let result = service::run_verify(ctx, &service::VerifyRequest { task_id: t, trust_confirmed: trust }, &cancel, op_id, move |msg| {
+        let result = service::run_verify(ctx, &service::VerifyRequest {
+            task_id: t,
+            trust_confirmed: trust,
+            profile_id: pid,
+            profile_hash: phash,
+            if_match,
+        }, &cancel, op_id, move |msg| {
             // step notifications become events for the UI
             let _ = store.append_event("check.step", &json!({"task_id": t_step, "step": msg}));
         });
@@ -879,14 +954,11 @@ async fn verify_ep(
         }))
     })?;
     let envelope = json!({"operation": {"id": op_id, "kind": "verify", "state": "pending"}});
-    if let Some(k) = &idem_key {
-        idem_store(&state, k, &digest, &envelope);
-    }
     let _ = state.events_tx.send(head_seq(&state));
     Ok((StatusCode::ACCEPTED, axum::Json(envelope)).into_response())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct HandoffBodyReq {
     source_mode: String,
     next_action: String,
@@ -906,41 +978,70 @@ async fn create_handoff_ep(
 ) -> ApiResult<Response> {
     check_host(&headers, &state)?;
     require_write(&headers, &state)?;
+    let if_match = if_match_revision(&headers)?;
     let Ok(axum::Json(body)) = body else {
         return Err(RelayError::validation("invalid JSON"));
     };
-    let digest = digest_of(&[task_id.as_bytes(), body.next_action.as_bytes(), body.source_mode.as_bytes()]);
+    // RC09: digest covers the FULL canonical request, not a subset; the
+    // operation row makes replays durable across restarts.
+    let canon = canonical_request(&serde_json::to_value(&body).map_err(RelayError::from)?)?;
+    let digest = digest_of(&[b"handoff", task_id.as_bytes(), canon.as_slice()]);
     let idem = idempotency_key(&headers);
     if let Some(k) = &idem {
-        if let Some(replay) = idem_replay(&state, k, &digest) {
-            return if replay.get("error").is_some() {
-                Err(RelayError::new(Code::ERequestConflict, "same Idempotency-Key with a different body"))
-            } else {
-                Ok(ok_json(replay))
-            };
+        match idem_start(&state, k, &digest)? {
+            IdemStart::Replay(env) => return Ok(ok_json(env)),
+            IdemStart::Conflict => {
+                return Err(RelayError::new(
+                    Code::ERequestConflict,
+                    "same Idempotency-Key used with a different request body",
+                ))
+            }
+            IdemStart::Fresh => {}
         }
     }
-    let (handoff_id, package_sha, md) = service::create_handoff(&state.ctx, &service::HandoffRequest {
+    if state.ctx.ops.any_active() {
+        return Err(RelayError::new(Code::ELimit, "another capture/check/import job is active"));
+    }
+    // Sync operation row: the replay envelope after completion carries the
+    // SAME handoff id and package hash as the original run.
+    let sync_op = crate::ids::new_uuid();
+    state.ctx.store.insert_operation(&sync_op, "handoff", Some(&task_id), idem.as_deref(), &digest)?;
+    // CAS for handoff export: the package binds the revision it was made from.
+    let rev = state.ctx.store.task_int(&task_id, "revision")?;
+    if rev != if_match {
+        return Err(RelayError::new(
+            Code::ERevisionConflict,
+            format!("If-Match revision {if_match} does not match current task revision {rev}"),
+        ));
+    }
+    let created = service::create_handoff(&state.ctx, &service::HandoffRequest {
         task_id: task_id.clone(),
         source_mode: body.source_mode,
         next_action: body.next_action,
         open_items: body.open_items,
         notes_constraints: body.notes_constraints,
         edited_fields: body.edited_fields,
-    })?;
-    let response = json!({
-        "operation": null,
-        "result": {
-            "handoff_id": handoff_id,
-            "package_sha256": package_sha,
-            "handoff_md": md,
-        }
     });
-    if let Some(k) = &idem {
-        idem_store(&state, k, &digest, &response);
-    }
+    let (handoff_id, package_sha, md) = match created {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = state.ctx.store.update_operation(
+                &sync_op,
+                "failed",
+                None,
+                Some(&json!({"code": e.code.as_str(), "message": e.message}).to_string()),
+            );
+            return Err(e);
+        }
+    };
+    let result = json!({
+        "handoff_id": handoff_id,
+        "package_sha256": package_sha,
+        "handoff_md": md,
+    });
+    sync_op_result(&state, &sync_op, &result)?;
     let _ = state.events_tx.send(head_seq(&state));
-    Ok(ok_json(response))
+    Ok(ok_json(json!({"operation": {"id": sync_op, "kind": "handoff", "state": "completed"}, "result": result})))
 }
 
 async fn handoff_package(
@@ -981,6 +1082,14 @@ async fn import_ep(
 ) -> ApiResult<Response> {
     check_host(&headers, &state)?;
     require_write(&headers, &state)?;
+    let if_match = if_match_revision(&headers)?;
+    let rev = state.ctx.store.task_int(&task_id, "revision")?;
+    if rev != if_match {
+        return Err(RelayError::new(
+            Code::ERevisionConflict,
+            format!("If-Match revision {if_match} does not match current task revision {rev}"),
+        ));
+    }
     if body.len() as i64 > crate::model::MAX_PACKAGE_EXPANDED_BYTES {
         return Err(RelayError::new(Code::ELimit, "upload too large").into());
     }
@@ -1251,6 +1360,11 @@ struct CliOpBody {
     attest_stopped: bool,
     #[serde(default = "default_true")]
     trust_confirmed: bool,
+    /// RC01: profile identity the CLI user approved (required for verify).
+    #[serde(default)]
+    profile_id: String,
+    #[serde(default)]
+    profile_hash: String,
 }
 
 fn default_true() -> bool {
@@ -1272,13 +1386,16 @@ async fn cli_capture(
     }
     let digest = digest_of(&[body.task_id.as_bytes(), serde_json::to_vec(&body).unwrap_or_default().as_slice()]);
     let t = body.task_id.clone();
+    let digest = digest_of(&[b"cli-capture", body.task_id.as_bytes(), serde_json::to_vec(&body).unwrap_or_default().as_slice()]);
     let (u, e, a) = (body.untracked_selected.clone(), body.extra_excludes.clone(), body.attest_stopped);
+    let rev = state.ctx.store.task_int(&body.task_id, "revision")?;
     let op_id = spawn_operation(&state, "capture", Some(&body.task_id), None, &digest, move |ctx, op_id, _c| {
         service::run_capture(ctx, &service::CaptureRequest {
             task_id: t,
             untracked_selected: u,
             extra_excludes: e,
             attest_stopped: a,
+            expected_revision: rev,
         }, op_id)
         .map(|r| json!({"snapshot_id": r.snapshot_id, "file_count": r.file_count}))
     })?;
@@ -1298,11 +1415,18 @@ async fn cli_verify(
     if state.ctx.ops.any_active() {
         return Err(RelayError::new(Code::ELimit, "another capture/check/import job is active"));
     }
-    let digest = digest_of(&[body.task_id.as_bytes(), b"verify"]);
+    let digest = digest_of(&[b"cli-verify", body.task_id.as_bytes(), serde_json::to_vec(&body).unwrap_or_default().as_slice()]);
     let t = body.task_id.clone();
     let trust = body.trust_confirmed;
+    let rev = state.ctx.store.task_int(&body.task_id, "revision")?;
     let op_id = spawn_operation(&state, "verify", Some(&body.task_id), None, &digest, move |ctx, op_id, cancel| {
-        service::run_verify(ctx, &service::VerifyRequest { task_id: t, trust_confirmed: trust }, &cancel, op_id, |_| {})
+        service::run_verify(ctx, &service::VerifyRequest {
+            task_id: t,
+            trust_confirmed: trust,
+            profile_id: body.profile_id.clone(),
+            profile_hash: body.profile_hash.clone(),
+            if_match: rev,
+        }, &cancel, op_id, |_| {})
             .map(|r| json!({"verification_id": r.verification_id, "round_status": r.round_status,
                              "results": r.results.iter().map(|x| x.to_json()).collect::<Vec<_>>()}))
     })?;
@@ -1315,4 +1439,16 @@ async fn cli_tasks(headers: HeaderMap, State(state): S) -> ApiResult<Response> {
     let tasks = state.ctx.store.list_tasks()?;
     let projects = state.ctx.store.list_projects()?;
     Ok(ok_json(json!({"operation": null, "result": {"tasks": tasks, "projects": projects}})))
+}
+
+/// RC01: the CLI needs the profile identity + revision to bind its approval.
+async fn cli_task_detail(
+    headers: HeaderMap,
+    State(state): S,
+    AxPath(task_id): AxPath<String>,
+) -> ApiResult<Response> {
+    check_host(&headers, &state)?;
+    require_cli_bearer(&headers, &state)?;
+    let detail = build_task_detail(&state, &task_id)?;
+    Ok(ok_json(json!({"operation": null, "result": detail})))
 }
