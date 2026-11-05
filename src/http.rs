@@ -278,6 +278,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/operations/{id}/cancel", post(cancel_ep))
         .route("/v1/events", get(events_ep))
         .route("/v1/claims", post(claim_ep))
+        .route("/v1/demo", post(demo_ep))
         .route("/v1/cli/attach", post(cli_attach))
         .route("/v1/cli/capture", post(cli_capture))
         .route("/v1/cli/verify", post(cli_verify))
@@ -313,15 +314,18 @@ async fn ui_asset(
     AxPath(path): AxPath<String>,
 ) -> ApiResult<Response> {
     check_host(&headers, &state)?;
-    let rel = path.trim_start_matches('/');
+    let tail = path.trim_start_matches('/');
     // No traversal possible: the embedded dir is fixed; still reject "..".
-    if rel.contains("..") {
+    if tail.contains("..") {
         return Err(RelayError::new(Code::EPathBoundary, "bad asset path"));
     }
+    // The URL /assets/<name> maps to dist/assets/<name>; also allow bare
+    // lookups for root-level files.
     let file = crate::ui::dist()
-        .get_file(rel)
+        .get_file(format!("assets/{tail}"))
+        .or_else(|| crate::ui::dist().get_file(tail))
         .ok_or_else(|| RelayError::not_found("asset not found"))?;
-    let mime = match rel.rsplit('.').next().unwrap_or("") {
+    let mime = match tail.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -704,6 +708,7 @@ struct CaptureBody {
     untracked_selected: Vec<String>,
     #[serde(default)]
     extra_excludes: Vec<String>,
+    #[serde(default)]
     attest_stopped: bool,
 }
 
@@ -1158,6 +1163,17 @@ fn event_stream(
 // ---------------------------------------------------------------------------
 // Claims (registration codes) + CLI channel
 // ---------------------------------------------------------------------------
+
+async fn demo_ep(headers: HeaderMap, State(state): S) -> ApiResult<Response> {
+    check_host(&headers, &state)?;
+    require_write(&headers, &state)?;
+    if state.ctx.ops.any_active() {
+        return Err(RelayError::new(Code::ELimit, "wait for the active job to finish").into());
+    }
+    let task_id = service::create_demo(&state.ctx)?;
+    let _ = state.events_tx.send(head_seq(&state));
+    Ok(ok_json(json!({"operation": null, "result": {"task_id": task_id}})))
+}
 
 #[derive(serde::Deserialize)]
 struct ClaimBody {

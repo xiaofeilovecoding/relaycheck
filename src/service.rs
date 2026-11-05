@@ -98,6 +98,116 @@ pub fn claim_project(ctx: &Ctx, code: &str) -> RelayResult<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Demo ("试用样例"): a real local fixture repo + a real local check, marked
+// Demo everywhere. No network, no model, no fabricated success.
+// ---------------------------------------------------------------------------
+
+pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
+    let repo_dir = ctx
+        .store
+        .data_dir
+        .join("demo")
+        .join(format!("repo-{}", new_token(6)));
+    std::fs::create_dir_all(&repo_dir)?;
+    let run = |args: &[&str]| -> RelayResult<()> {
+        let git = git_exe_path()?;
+        let out = std::process::Command::new(git)
+            .args(args)
+            .current_dir(&repo_dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_dev())
+            .env("GIT_CONFIG_SYSTEM", null_dev())
+            .env("GIT_AUTHOR_NAME", "RelayCheck Demo")
+            .env("GIT_AUTHOR_EMAIL", "demo@local")
+            .env("GIT_COMMITTER_NAME", "RelayCheck Demo")
+            .env("GIT_COMMITTER_EMAIL", "demo@local")
+            .output()
+            .map_err(|e| RelayError::internal(format!("git spawn: {e}")))?;
+        if !out.status.success() {
+            return Err(RelayError::internal("demo git step failed"));
+        }
+        Ok(())
+    };
+    run(&["init", "-q"])?;
+    run(&["config", "user.email", "demo@local"])?;
+    run(&["config", "user.name", "RelayCheck Demo"])?;
+    std::fs::create_dir_all(repo_dir.join("src"))?;
+    std::fs::write(repo_dir.join("src").join("retry.py"), b"def retry(fn, times=3):\n    return fn()\n")?;
+    std::fs::create_dir_all(repo_dir.join("tests"))?;
+    std::fs::write(repo_dir.join("tests").join("test_retry.py"), b"def test_retry():\n    assert retry(lambda: 1) == 1\n")?;
+    run(&["add", "."])?;
+    run(&["commit", "-qm", "demo base"])?;
+
+    // Register + immediately claim (demo is created by the local service).
+    let (project_id, code) = attach_project(ctx, &repo_dir.to_string_lossy(), Some("demo-retry-lab"))?;
+    ctx.store.consume_register_claim(&code)?;
+
+    let task_id = create_task(
+        ctx,
+        TaskDraft {
+            project_id: project_id.clone(),
+            goal: if cfg!(windows) {
+                "演示：修复重试次数的边界（Demo / simulated relay）".into()
+            } else {
+                "Demo: fix the retry boundary".into()
+            },
+            constraints: vec![
+                "保持公开函数签名不变".into(),
+                "不自动应用、提交或推送".into(),
+            ],
+            criteria: vec![Criterion { id: "SC1".into(), text: "重试边界被测试覆盖".into(), required: true }],
+        },
+        true,
+    )?;
+
+    // A real local check: cmd.exe /c exit 0 (always available on Windows).
+    let check_exe = if cfg!(windows) {
+        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\\Windows\\System32\\cmd.exe".into())
+    } else {
+        "/bin/sh".into()
+    };
+    let check_args: Vec<String> = if cfg!(windows) {
+        vec!["/c".into(), "exit".into(), "0".into()]
+    } else {
+        vec!["-c".into(), "exit 0".into()]
+    };
+    let profile = save_profile(
+        ctx,
+        &task_id,
+        "demo-checks",
+        vec![CheckStep {
+            id: "demo-check".into(),
+            exe: check_exe,
+            args: check_args,
+            cwd_relative: String::new(),
+            timeout_seconds: 60,
+            required: true,
+        }],
+        vec![],
+        vec![],
+    )?;
+    ctx.store.set_profile_trusted(&profile.id, true)?;
+    // Demo attestation: the service created this empty repo itself; no
+    // external tool could be writing it (documented in the UI copy).
+    run_capture(
+        ctx,
+        &CaptureRequest {
+            task_id,
+            untracked_selected: vec![],
+            extra_excludes: vec![],
+            attest_stopped: true,
+        },
+        "demo-capture",
+    )?;
+    let _ = ctx.store.append_event("demo.created", &serde_json::json!({}));
+    Ok(ctx.store.list_tasks()?.first().and_then(|t| t.get("id").and_then(|v| v.as_str())).map(|s| s.to_string()).unwrap_or_default())
+}
+
+fn null_dev() -> &'static str {
+    if cfg!(windows) { "nul" } else { "/dev/null" }
+}
+
+// ---------------------------------------------------------------------------
 // Tasks
 // ---------------------------------------------------------------------------
 
