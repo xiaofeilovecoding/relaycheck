@@ -1,0 +1,16 @@
+RelayCheck
+Copyright 2026 RelayCheck contributors
+
+This product is MIT-licensed (see the LICENSE placeholder in the release
+review notes; 0.1 is a review candidate and the final license text ships
+with the packaging round).
+
+Third-party runtime dependencies (Rust crates, see Cargo.lock for exact
+versions): tokio, axum, hyper, rusqlite (bundled SQLite — public domain),
+serde, serde_json, sha2, hex, uuid, zip, rand, regex, ureq, futures-util,
+include_dir, windows-sys. Frontend build-time dependencies (none ship to
+users): react, react-dom, vite, typescript.
+
+The bundled SQLite is maintained by the SQLite project
+(https://sqlite.org). This product is not affiliated with any coding-tool
+vendor; all product names are trademarks of their respective owners.

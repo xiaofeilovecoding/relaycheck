@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://relaycheck.local/schemas/receipt.schema.json",
+  "title": "RelayCheck handoff receipt (schema 1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "kind", "handoff_id", "task_id", "task_revision",
+    "snapshot_id", "source_mode", "coverage", "goal", "next_action"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "enum": ["handoff", "return"] },
+    "handoff_id": { "$ref": "#/$defs/uuid" },
+    "parent_handoff_id": { "$ref": "#/$defs/uuid" },
+    "task_id": { "$ref": "#/$defs/uuid" },
+    "task_revision": { "type": "integer", "minimum": 1 },
+    "snapshot_id": { "$ref": "#/$defs/hashid" },
+    "base_head": { "type": "string", "maxLength": 64 },
+    "source_mode": { "enum": ["context_only", "portable_source"] },
+    "coverage": { "type": "string" },
+    "goal": { "type": "string", "maxLength": 4000 },
+    "constraints": { "type": "array", "items": { "type": "string" }, "maxItems": 64 },
+    "open_items": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "text"],
+        "properties": {
+          "id": { "type": "string", "maxLength": 32 },
+          "text": { "type": "string", "maxLength": 1000 }
+        }
+      }
+    },
+    "next_action": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "origin", "check_id", "status", "snapshot_id"],
+        "properties": {
+          "kind": { "const": "verification" },
+          "origin": { "const": "exporter_reported" },
+          "check_id": { "type": "string", "maxLength": 64 },
+          "status": { "enum": ["passed", "failed", "blocked", "interrupted"] },
+          "snapshot_id": { "$ref": "#/$defs/hashid" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" },
+    "hashid": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

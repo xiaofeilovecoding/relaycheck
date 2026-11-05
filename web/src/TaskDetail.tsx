@@ -43,6 +43,14 @@ export function TaskDetail({
     setCriteriaAck(cs.filter((c: any) => c.required).map((c: any) => c.id));
   }, [detail?.task?.id, detail?.task?.revision]);
 
+  // While a check round is running, poll the detail so the UI follows the
+  // real state machine (SSE handles the task list; detail reloads here).
+  useEffect(() => {
+    if (detail?.task?.workflow_state !== "checking") return;
+    const h = window.setInterval(() => { load(); }, 2000);
+    return () => window.clearInterval(h);
+  }, [detail?.task?.workflow_state, load]);
+
   // One-shot candidate alignment (≤160ms) whenever the active candidate
   // changes; idle renders stay static (CSS also honors reduced-motion).
   useEffect(() => {
@@ -679,7 +687,22 @@ function CaptureModal({
                 setBusy(true);
                 setErr(null);
                 try {
-                  await api.capture(taskId, { attest_stopped: true, untracked_selected: untracked, extra_excludes: [] }, crypto.randomUUID());
+                  const r = await api.capture(taskId, { attest_stopped: true, untracked_selected: untracked, extra_excludes: [] }, crypto.randomUUID());
+                  // Wait for the operation to settle before refreshing: the
+                  // SSE event alone does not reload this detail view.
+                  const opId = r?.operation?.id;
+                  if (opId) {
+                    for (;;) {
+                      await new Promise((res) => setTimeout(res, 500));
+                      const op = await api.operation(opId);
+                      const st = op.state as string;
+                      if (st === "completed") break;
+                      if (st === "failed" || st === "cancelled" || st === "interrupted") {
+                        const err = op.error ?? {};
+                        throw new ApiError(err.code ?? st, err.message ?? "capture failed", err.details ?? []);
+                      }
+                    }
+                  }
                   await onDone();
                 } catch (e) {
                   setErr(e as ApiError);

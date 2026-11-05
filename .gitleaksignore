@@ -1,0 +1,6 @@
+# These are intentional FAKE fixture strings that test the secret detector
+# itself (src/secrets.rs). They are not credentials.
+src/secrets.rs:private-key:113
+src/secrets.rs:generic-api-key:125
+26583988c46375b4db87828b0cead26bd32307c0:src/secrets.rs:private-key:113
+26583988c46375b4db87828b0cead26bd32307c0:src/secrets.rs:generic-api-key:125

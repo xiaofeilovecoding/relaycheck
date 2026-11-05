@@ -492,6 +492,15 @@ pub fn run_verify(ctx: &Ctx, req: &VerifyRequest, cancel: &checks::CancelFlag, o
             "checks run your local code; review the repository and command first, then approve",
         ));
     }
+    // The explicit confirmation IS the approval act (spec §5: 保存并明确批准才可执行).
+    // Mark the current profile revision trusted so this and later rounds run.
+    let pre_id = ctx
+        .store
+        .task_field_opt(task_id, "profile_id")?
+        .unwrap_or_default();
+    if !pre_id.is_empty() {
+        ctx.store.set_profile_trusted(&pre_id, true)?;
+    }
     let active = ctx
         .store
         .task_field_opt(task_id, "active_snapshot")?
