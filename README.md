@@ -14,6 +14,8 @@ tools — with file versions, checks, and the next step kept together.
 
 ![Task detail, light theme, English](docs/img/desktop-light-en.png)
 
+![Handoff preview, light theme, English](docs/img/handoff-light-en-preview.png)
+
 ## What it is (and is not)
 
 RelayCheck runs one local service on your machine: register a Git project,

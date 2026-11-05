@@ -281,6 +281,11 @@ export function TaskDetail({ taskId, t, lang, onBack, onChanged, detailTick }: D
                 {t.prepareHandoff}
               </button>
             ) : null}
+            {task.workflow_state === "ready_for_review" && primary.action !== "prepare_handoff" ? (
+              <button className="secondary" onClick={() => setModal("handoff")}>
+                {t.prepareHandoff}
+              </button>
+            ) : null}
             {active && primary.action !== "capture" ? (
               <button className="secondary" onClick={() => setModal("capture")} disabled={runningOp}>
                 {t.captureCandidate}
