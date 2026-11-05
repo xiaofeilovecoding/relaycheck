@@ -221,14 +221,19 @@ pub fn spawn_operation(
     let op_id2 = op_id.clone();
     let kind2 = kind.to_string();
     std::thread::spawn(move || {
-        st.ctx.store.update_operation(&op_id2, "running", None, None)?;
-        let result = work(&st.ctx, &op_id2, cancel);
-        match result {
+        // The write slot MUST be released on every path, or every later
+        // capture/verify/import is refused with E_LIMIT forever.
+        let outcome = (|| -> RelayResult<serde_json::Value> {
+            st.ctx.store.update_operation(&op_id2, "running", None, None)?;
+            work(&st.ctx, &op_id2, cancel)
+        })();
+        let _ = kind2;
+        match outcome {
             Ok(v) => {
-                st.ctx.store.update_operation(&op_id2, "completed", Some(&v.to_string()), None)?;
+                let _ = st.ctx.store.update_operation(&op_id2, "completed", Some(&v.to_string()), None);
             }
             Err(e) => {
-                st.ctx.store.update_operation(
+                let _ = st.ctx.store.update_operation(
                     &op_id2,
                     "failed",
                     None,
@@ -236,14 +241,13 @@ pub fn spawn_operation(
                         &json!({"code": e.code.as_str(), "message": e.message, "details": e.details})
                             .to_string(),
                     ),
-                )?;
+                );
             }
         }
-        let _ = kind2;
+        st.ctx.ops.finish(&op_id2);
         let _ = st
             .events_tx
             .send(st.ctx.store.event_bounds().map(|(_, max)| max).unwrap_or(0));
-        Ok::<(), RelayError>(())
     });
     Ok(op_id)
 }
@@ -295,6 +299,9 @@ async fn fallback() -> Response {
 // Static UI (anonymous but Host-checked; only the fixed shell, no disk paths)
 // ---------------------------------------------------------------------------
 
+/// Frozen CSP: self only, no remote anything (spec §7).
+const STATIC_CSP: &str = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; font-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'";
+
 async fn ui_index(headers: HeaderMap, State(state): S) -> ApiResult<Response> {
     check_host(&headers, &state)?;
     let index = crate::ui::dist()
@@ -302,7 +309,10 @@ async fn ui_index(headers: HeaderMap, State(state): S) -> ApiResult<Response> {
         .ok_or_else(|| RelayError::internal("UI assets are missing"))?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
-         (axum::http::header::CACHE_CONTROL, "no-store")],
+         (axum::http::header::CACHE_CONTROL, "no-store"),
+         (axum::http::header::CONTENT_SECURITY_POLICY, STATIC_CSP),
+         (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+         (axum::http::header::REFERRER_POLICY, "no-referrer")],
         index.contents().to_vec(),
     )
         .into_response())
@@ -336,7 +346,10 @@ async fn ui_asset(
         _ => "application/octet-stream",
     };
     Ok((
-        [(axum::http::header::CONTENT_TYPE, mime), (axum::http::header::CACHE_CONTROL, "no-store")],
+        [(axum::http::header::CONTENT_TYPE, mime),
+         (axum::http::header::CACHE_CONTROL, "no-store"),
+         (axum::http::header::CONTENT_SECURITY_POLICY, STATIC_CSP),
+         (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")],
         file.contents().to_vec(),
     )
         .into_response())
@@ -765,6 +778,7 @@ async fn capture_ep(
     let attest = body.attest_stopped;
     let untracked = body.untracked_selected.clone();
     let excludes = body.extra_excludes.clone();
+    let idem_key = idem.clone();
     let op_id = spawn_operation(&state, "capture", Some(&task_id), idem, &digest, move |ctx, op_id, _cancel| {
         service::run_capture(ctx, &service::CaptureRequest {
             task_id: t,
@@ -780,8 +794,12 @@ async fn capture_ep(
             "is_return": r.is_return,
         }))
     })?;
+    let envelope = json!({"operation": {"id": op_id, "kind": "capture", "state": "pending"}});
+    if let Some(k) = &idem_key {
+        idem_store(&state, k, &digest, &envelope);
+    }
     let _ = st.events_tx.send(head_seq(&state));
-    Ok((StatusCode::ACCEPTED, axum::Json(json!({"operation": {"id": op_id, "kind": "capture", "state": "pending"}}))).into_response())
+    Ok((StatusCode::ACCEPTED, axum::Json(envelope)).into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -846,6 +864,7 @@ async fn verify_ep(
     }
     let t = task_id.clone();
     let trust = body.trust_confirmed;
+    let idem_key = idem.clone();
     let op_id = spawn_operation(&state, "verify", Some(&task_id), idem, &digest, move |ctx, op_id, cancel| {
         let store = ctx.store.clone();
         let t_step = t.clone();
@@ -859,8 +878,12 @@ async fn verify_ep(
             "results": r.results.iter().map(|x| x.to_json()).collect::<Vec<_>>(),
         }))
     })?;
+    let envelope = json!({"operation": {"id": op_id, "kind": "verify", "state": "pending"}});
+    if let Some(k) = &idem_key {
+        idem_store(&state, k, &digest, &envelope);
+    }
     let _ = state.events_tx.send(head_seq(&state));
-    Ok((StatusCode::ACCEPTED, axum::Json(json!({"operation": {"id": op_id, "kind": "verify", "state": "pending"}}))).into_response())
+    Ok((StatusCode::ACCEPTED, axum::Json(envelope)).into_response())
 }
 
 #[derive(serde::Deserialize)]

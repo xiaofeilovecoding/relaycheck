@@ -295,3 +295,34 @@ fn r05_profile_validation_rejects_scripts_and_relative_exe() {
     assert!(err.message.contains("must not cover source"), "msg: {}", err.message);
     env.cleanup();
 }
+
+#[test]
+fn r05_secret_across_flushed_chunks_is_redacted() {
+    // R11: a canary split across separately flushed writes must still be
+    // redacted from the stored summary (we scan the complete bounded buffer,
+    // so chunk boundaries cannot hide a match).
+    let env = TestEnv::new("r05h");
+    let repo = env.make_git_repo("chunks");
+    repo.write("a.txt", b"x
+");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-qm", "c"]);
+    let (_p, task_id) = setup_project_task(&env, &repo, "cross-chunk");
+    let _ = capture_all(&env, &task_id);
+    let script = r#"
+import sys, time
+sys.stdout.write("token=RC_CANARY_LI")
+sys.stdout.flush()
+time.sleep(0.2)
+sys.stdout.write("VE_TOKEN_0123456789abcdef\n")
+sys.stdout.flush()
+sys.exit(0)
+"#;
+    let _ = setup_python_profile(&env, &task_id, script, "leaker");
+    let v = verify_now(&env, &task_id);
+    assert_eq!(v.round_status, "passed", "the check itself exits 0; results: {:?}", v.results);
+    let summary = &v.results[0].summary;
+    assert!(!summary.contains("RC_CANARY"), "secret leaked in summary: {summary}");
+    assert!(v.results[0].redactions >= 1, "redaction counted");
+    env.cleanup();
+}
