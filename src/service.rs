@@ -223,9 +223,13 @@ pub fn run_capture(ctx: &Ctx, req: &CaptureRequest, op_id: &str) -> RelayResult<
         .with_details(offenders));
     }
 
-    let parent = ctx.store.task_field(task_id, "active_snapshot")?;
-    let parent_opt = if parent.is_empty() { None } else { Some(parent.as_str()) };
-    let is_return = ctx.store.task_field(task_id, "parent_handoff")?.is_empty() == false;
+    let parent = ctx.store.task_field_opt(task_id, "active_snapshot")?;
+    let parent_opt = parent.as_deref();
+    let is_return = ctx
+        .store
+        .task_field_opt(task_id, "parent_handoff")?
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
 
     let outcome = capture::capture_from_repo(
         &root,
@@ -306,7 +310,10 @@ pub fn save_profile(
     outputs: Vec<String>,
 ) -> RelayResult<CheckProfile> {
     // Validate against the current snapshot inputs when one exists.
-    let active = ctx.store.task_field(task_id, "active_snapshot")?;
+    let active = ctx
+        .store
+        .task_field_opt(task_id, "active_snapshot")?
+        .unwrap_or_default();
     let input_paths: Vec<String> = if active.is_empty() {
         Vec::new()
     } else {
@@ -357,11 +364,17 @@ pub fn run_verify(ctx: &Ctx, req: &VerifyRequest, cancel: &checks::CancelFlag, o
             "checks run your local code; review the repository and command first, then approve",
         ));
     }
-    let active = ctx.store.task_field(task_id, "active_snapshot")?;
+    let active = ctx
+        .store
+        .task_field_opt(task_id, "active_snapshot")?
+        .unwrap_or_default();
     if active.is_empty() {
         return Err(RelayError::state("capture a candidate before running checks"));
     }
-    let profile_id = ctx.store.task_field(task_id, "profile_id")?;
+    let profile_id = ctx
+        .store
+        .task_field_opt(task_id, "profile_id")?
+        .unwrap_or_default();
     if profile_id.is_empty() {
         return Err(RelayError::state("save and approve a check profile first"));
     }
@@ -454,7 +467,10 @@ pub fn create_handoff(ctx: &Ctx, req: &HandoffRequest) -> RelayResult<(String, S
             "next_action is required to export a formal handoff; save a draft in the UI instead",
         ));
     }
-    let active = ctx.store.task_field(&req.task_id, "active_snapshot")?;
+    let active = ctx
+        .store
+        .task_field_opt(&req.task_id, "active_snapshot")?
+        .unwrap_or_default();
     if active.is_empty() {
         return Err(RelayError::state("capture a candidate before preparing a handoff"));
     }
@@ -780,6 +796,7 @@ pub fn diff_snapshots(ctx: &Ctx, from: &str, to: &str, fill_details: bool) -> Re
 // Acceptance
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct AcceptCheck {
     pub ok: bool,
     pub missing: Vec<String>,
@@ -791,14 +808,20 @@ pub struct AcceptCheck {
 /// Computes acceptance eligibility (UI shows the concrete missing items).
 pub fn acceptance_check(ctx: &Ctx, task_id: &str) -> RelayResult<AcceptCheck> {
     let mut missing = Vec::new();
-    let active = ctx.store.task_field(task_id, "active_snapshot")?;
+    let active = ctx
+        .store
+        .task_field_opt(task_id, "active_snapshot")?
+        .unwrap_or_default();
     let rev = ctx.store.task_int(task_id, "revision")?;
     let epoch = ctx.store.environment_epoch();
     if active.is_empty() {
         missing.push("no active candidate".into());
         return Ok(AcceptCheck { ok: false, missing, profile_hash: String::new(), revision: rev, snapshot_id: active });
     }
-    let profile_id = ctx.store.task_field(task_id, "profile_id")?;
+    let profile_id = ctx
+        .store
+        .task_field_opt(task_id, "profile_id")?
+        .unwrap_or_default();
     if profile_id.is_empty() {
         missing.push("no check profile saved".into());
         return Ok(AcceptCheck { ok: false, missing, profile_hash: String::new(), revision: rev, snapshot_id: active });

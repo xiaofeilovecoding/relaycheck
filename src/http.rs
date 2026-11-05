@@ -496,7 +496,9 @@ pub fn build_task_detail(state: &ServerState, task_id: &str) -> RelayResult<serd
     let imported = store.imported_reports_for_task(task_id)?;
     let acceptances = store.acceptances_for_task(task_id)?;
     let profile = {
-        let pid = store.task_field(task_id, "profile_id")?;
+        let pid = store
+            .task_field_opt(task_id, "profile_id")?
+            .unwrap_or_default();
         if pid.is_empty() {
             None
         } else {

@@ -45,10 +45,18 @@ pub fn validate_root(raw: &str) -> RelayResult<String> {
     if !p.is_absolute() {
         return Err(path_boundary_error("path is not absolute"));
     }
-    // Component checks for the root (no empty components, no reserved names).
-    for comp in p.components() {
+    // Component checks for the root. The first component may be the drive
+    // prefix (e.g. `D:`); everything else uses the full name rules.
+    for (idx, comp) in p.components().enumerate() {
         let name = comp.as_os_str().to_string_lossy();
-        if name.contains(':') && name.len() > 2 {
+        let is_drive = idx == 0
+            && name.len() == 2
+            && name.as_bytes()[1] == b':'
+            && name.as_bytes()[0].is_ascii_alphabetic();
+        if is_drive {
+            continue;
+        }
+        if name.contains(':') {
             return Err(path_boundary_error("illegal path component"));
         }
         check_component(&name)?;
@@ -192,9 +200,11 @@ pub fn to_wide(s: &str) -> Vec<u16> {
 }
 
 /// Prepend the extended-length prefix for local file IO on Windows.
+/// `\\?\` paths skip Win32 normalization, so separators must be canonical
+/// backslashes first (forward slashes stop being separators after the prefix).
 #[cfg(windows)]
 pub fn extended_path(p: &Path) -> std::path::PathBuf {
-    let s = p.to_string_lossy().to_string();
+    let s = p.to_string_lossy().replace('/', "\\");
     if s.starts_with(r"\\?\") {
         std::path::PathBuf::from(s)
     } else {

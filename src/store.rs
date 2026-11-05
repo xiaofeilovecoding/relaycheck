@@ -369,6 +369,30 @@ impl Store {
             .ok_or_else(|| RelayError::not_found("task not found"))
     }
 
+    /// Nullable column read: distinguishes "task missing" from "column NULL".
+    pub fn task_field_opt(&self, task_id: &str, field: &str) -> RelayResult<Option<String>> {
+        let allowed = [
+            "id",
+            "project_id",
+            "goal",
+            "constraints_json",
+            "criteria_json",
+            "active_snapshot",
+            "parent_handoff",
+            "profile_id",
+            "workflow_state",
+        ];
+        if !allowed.contains(&field) {
+            return Err(RelayError::internal("bad field name"));
+        }
+        let sql = format!("SELECT {field} FROM tasks WHERE id=?1");
+        let row = self
+            .lock()
+            .query_row(&sql, params![task_id], |r| r.get::<_, Option<String>>(0))
+            .optional()?;
+        row.ok_or_else(|| RelayError::not_found("task not found"))
+    }
+
     pub fn task_int(&self, task_id: &str, field: &str) -> RelayResult<i64> {
         let allowed = ["revision", "candidate_epoch", "is_demo"];
         if !allowed.contains(&field) {
@@ -734,7 +758,7 @@ impl Store {
     ) -> RelayResult<Option<VerificationRecord>> {
         let conn = self.lock();
         let (rev, epoch, cepoch, profile_id): (i64, i64, i64, Option<String>) = conn.query_row(
-            "SELECT revision,candidate_epoch,(SELECT environment_epoch FROM settings WHERE key='environment_epoch'),profile_id FROM tasks WHERE id=?1",
+            "SELECT revision,(SELECT CAST(value AS INTEGER) FROM settings WHERE key='environment_epoch'),candidate_epoch,profile_id FROM tasks WHERE id=?1",
             params![task_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
