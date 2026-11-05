@@ -91,28 +91,49 @@ def run(exe, port, token, out_dir):
         wait_page(page, 5000)
         snap(page, "desktop-light-zh-ready")
 
-        # Handoff export (V05 source side).
-        click_text(page, "main button", "预览并导出接手卡")
-        wait_page(page, 1000)
-        page.evaluate(
-            """() => {
-            const set = (el, v) => {
-              const proto = Object.getPrototypeOf(el);
-              Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
-              el.dispatchEvent(new Event('input', { bubbles: true }));
-            };
-            const tas = [...document.querySelectorAll('.modal textarea')];
-            set(tas[0], '先阅读 tests/test_retry.py，复现等待重试时的取消行为。');
-            set(tas[1], 'C2: 取消行为尚未验证');
-        }""",
-            None,
+        # Handoff export (V05 source side) — ENGLISH first (same-language
+        # materials per RC06), then Chinese.
+        def export_handoff_shot(next_action, open_items, shot, btn="预览并导出接手卡", export_btn="导出接手包"):
+            click_text(page, "main button", btn)
+            wait_page(page, 1000)
+            page.evaluate(
+                """([na, oi]) => {
+                const set = (el, v) => {
+                  const proto = Object.getPrototypeOf(el);
+                  Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                };
+                const tas = [...document.querySelectorAll('.modal textarea')];
+                set(tas[0], na);
+                set(tas[1], oi);
+            }""",
+                [next_action, open_items],
+            )
+            wait_page(page, 400)
+            click_text(page, ".modal button", export_btn)
+            wait_page(page, 2500)
+            snap(page, shot)
+            page.keyboard.press("Escape")
+            wait_page(page, 600)
+
+        click_text(page, ".controls button", "EN")
+        wait_page(page, 800)
+        export_handoff_shot(
+            "Read tests/test_retry.py and reproduce C2 while a retry waits.",
+            "C2: cancellation is not verified",
+            "handoff-light-en-preview",
+            btn="Preview & export handoff",
+            export_btn="Export handoff package",
         )
-        wait_page(page, 400)
-        click_text(page, ".modal button", "导出接手包")
-        wait_page(page, 2500)
-        snap(page, "handoff-light-zh-preview")
-        page.keyboard.press("Escape")
-        wait_page(page, 600)
+        click_text(page, "main button", "Preview & export handoff")
+        wait_page(page, 1000)
+        click_text(page, ".controls button", "中文")
+        wait_page(page, 800)
+        export_handoff_shot(
+            "先阅读 tests/test_retry.py，复现等待重试时的取消行为。",
+            "C2: 取消行为尚未验证",
+            "handoff-light-zh-preview",
+        )
 
         # Return B: external tool edits the demo repo, capture through the UI.
         import glob
@@ -124,7 +145,11 @@ def run(exe, port, token, out_dir):
             encoding="utf-8",
         )
         (repo / "tests" / "test_retry.py").write_text(
-            "def test_retry():\n    assert retry(lambda: 1) == 1\n\ndef test_cancel():\n    assert True\n",
+            "import sys\nsys.path.insert(0, 'src')\nfrom retry import retry\n"
+            "assert retry(lambda: 1) == 1\n"
+            "assert retry(lambda: 2, times=9) == 2\n"
+            "try:\n    retry(lambda: 1, cancelled=True)\n    print('FAIL: no raise')\n    sys.exit(1)\n"
+            "except TimeoutError:\n    pass\nprint('returned behaviour ok')\n",
             encoding="utf-8",
         )
         click_text(page, "main button", "捕获候选")

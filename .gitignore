@@ -2,7 +2,3 @@
 web/node_modules/
 web/dist/
 *.log
-
-# Screenshots are generated locally (scripts/capture_screenshots.py) and are
-# deliberately kept OUT of the product git history.
-docs/img/

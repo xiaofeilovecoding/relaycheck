@@ -296,10 +296,11 @@ details.activity ul { margin: 8px 0 0; padding-left: 18px; }
 
 @media (max-width: 760px) {
   .app { display: block; }
-  .sidebar { flex-direction: row; align-items: center; gap: 14px; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
-  .brand { font-size: 17px; }
-  .nav { display: flex; gap: 4px; }
-  .nav-item { padding: 8px 10px; min-height: 44px; }
+  .sidebar { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand { font-size: 16px; }
+  .nav { display: flex; flex-wrap: wrap; gap: 2px; min-width: 0; }
+  .nav-item { padding: 8px 8px; min-height: 44px; }
+  .nav-item span:last-child { font-size: 13px; }
   .side-note { display: none; }
   main.detail { padding: 17px 16px 28px; }
   .split { display: block; }

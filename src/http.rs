@@ -663,28 +663,30 @@ fn collect_task_snapshots(store: &Store, task_id: &str) -> RelayResult<Vec<serde
 
 fn compute_primary(workflow: &str, no_snapshot: bool, parent_handoff: Option<&str>) -> serde_json::Value {
     use serde_json::json;
+    // reason_key is the machine-readable stage the UI localizes; reason is
+    // the English fallback for API consumers.
     if no_snapshot {
-        return json!({"action": "capture", "reason": "draft: no candidate captured yet"});
+        return json!({"action": "capture", "reason_key": "primary.draft", "reason": "draft: no candidate captured yet"});
     }
     match workflow {
-        "checking" => json!({"action": null, "reason": "checks are running"}),
-        "rework" => json!({"action": "view_issues", "reason": "checks did not pass on this candidate"}),
+        "checking" => json!({"action": null, "reason_key": "primary.checking", "reason": "checks are running"}),
+        "rework" => json!({"action": "view_issues", "reason_key": "primary.rework", "reason": "checks did not pass on this candidate"}),
         "candidate" => {
             if parent_handoff.is_some() {
-                json!({"action": "run_checks", "reason": "a candidate came back; verify it locally"})
+                json!({"action": "run_checks", "reason_key": "primary.returned", "reason": "a candidate came back; verify it locally"})
             } else {
-                json!({"action": "run_checks", "reason": "candidate has no current local verification"})
+                json!({"action": "run_checks", "reason_key": "primary.unchecked", "reason": "candidate has no current local verification"})
             }
         }
         "ready_for_review" => {
             if parent_handoff.is_some() {
-                json!({"action": "accept", "reason": "all required checks passed on the returned candidate"})
+                json!({"action": "accept", "reason_key": "primary.ready_return", "reason": "all required checks passed on the returned candidate"})
             } else {
-                json!({"action": "prepare_handoff", "reason": "ready to prepare the handoff card"})
+                json!({"action": "prepare_handoff", "reason_key": "primary.ready", "reason": "ready to prepare the handoff card"})
             }
         }
-        "accepted" => json!({"action": null, "reason": "accepted; changes are not applied or merged automatically"}),
-        _ => json!({"action": null, "reason": ""}),
+        "accepted" => json!({"action": null, "reason_key": "primary.accepted", "reason": "accepted; changes are not applied or merged automatically"}),
+        _ => json!({"action": null, "reason_key": "", "reason": ""}),
     }
 }
 

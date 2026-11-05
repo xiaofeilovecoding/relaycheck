@@ -84,30 +84,30 @@ export const api = {
       }),
     );
   },
-  async capture(taskId: string, body: any, idempotency: string): Promise<any> {
+  async capture(taskId: string, body: any, idempotency: string, ifMatch: number): Promise<any> {
     return handle(
       await fetch(`/v1/tasks/${encodeURIComponent(taskId)}/capture`, {
         method: "POST",
-        headers: { ...headers(true, idempotency), "Content-Type": "application/json" },
+        headers: { ...headers(true, idempotency, ifMatch), "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }),
     );
   },
-  async saveProfile(taskId: string, body: any): Promise<any> {
+  async saveProfile(taskId: string, body: any, ifMatch: number): Promise<any> {
     return handle(
       await fetch(`/v1/tasks/${encodeURIComponent(taskId)}/profile`, {
         method: "POST",
-        headers: { ...headers(true), "Content-Type": "application/json" },
+        headers: { ...headers(true, undefined, ifMatch), "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }),
     );
   },
-  async verify(taskId: string, trust: boolean, idempotency: string): Promise<any> {
+  async verify(taskId: string, identity: { profile_id: string; profile_hash: string }, ifMatch: number, idempotency: string): Promise<any> {
     return handle(
       await fetch(`/v1/tasks/${encodeURIComponent(taskId)}/verify`, {
         method: "POST",
-        headers: { ...headers(true, idempotency), "Content-Type": "application/json" },
-        body: JSON.stringify({ trust_confirmed: trust }),
+        headers: { ...headers(true, idempotency, ifMatch), "Content-Type": "application/json" },
+        body: JSON.stringify({ trust_confirmed: true, ...identity }),
       }),
     );
   },
@@ -122,11 +122,11 @@ export const api = {
       }),
     );
   },
-  async createHandoff(taskId: string, body: any, idempotency: string): Promise<any> {
+  async createHandoff(taskId: string, body: any, idempotency: string, ifMatch: number): Promise<any> {
     return handle(
       await fetch(`/v1/tasks/${encodeURIComponent(taskId)}/handoffs`, {
         method: "POST",
-        headers: { ...headers(true, idempotency), "Content-Type": "application/json" },
+        headers: { ...headers(true, idempotency, ifMatch), "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }),
     );
@@ -134,11 +134,11 @@ export const api = {
   handoffPackageUrl(handoffId: string): string {
     return `/v1/handoffs/${encodeURIComponent(handoffId)}/package`;
   },
-  async importPackage(taskId: string, file: File): Promise<any> {
+  async importPackage(taskId: string, file: File, ifMatch: number): Promise<any> {
     return handle(
       await fetch(`/v1/tasks/${encodeURIComponent(taskId)}/imports`, {
         method: "POST",
-        headers: headers(true),
+        headers: headers(true, undefined, ifMatch),
         body: file,
       }),
     );
@@ -160,6 +160,14 @@ export const api = {
         body: JSON.stringify({ criteria_ack: criteriaAck }),
       }),
     );
+  },
+  async waitOperation(opId: string): Promise<any> {
+    for (;;) {
+      const op = await this.operation(opId);
+      const st = op.state as string;
+      if (st === "completed" || st === "failed" || st === "cancelled" || st === "interrupted") return op;
+      await new Promise((res) => setTimeout(res, 500));
+    }
   },
   async claim(code: string): Promise<any> {
     return handle(

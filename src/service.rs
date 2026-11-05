@@ -27,6 +27,27 @@ pub struct Ctx {
     pub isolated_home: std::path::PathBuf,
 }
 
+/// Locates a Python interpreter for the demo's real check. Returns None
+/// honestly when none exists (the demo then ships without a check profile).
+pub fn find_python_exe() -> Option<std::path::PathBuf> {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let p = dir.join(if cfg!(windows) { "python.exe" } else { "python3" });
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    let candidates = ["D:/dev/python/python.exe", "C:/Python314/python.exe", "C:/Python312/python.exe"];
+    for c in candidates {
+        let p = std::path::PathBuf::from(c);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 pub fn git_exe_path() -> RelayResult<std::path::PathBuf> {
     // Locate git from PATH; never bundled, always the user's tool.
     let candidates = if cfg!(windows) {
@@ -132,9 +153,18 @@ pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
     run(&["config", "user.email", "demo@local"])?;
     run(&["config", "user.name", "RelayCheck Demo"])?;
     std::fs::create_dir_all(repo_dir.join("src"))?;
-    std::fs::write(repo_dir.join("src").join("retry.py"), b"def retry(fn, times=3):\n    return fn()\n")?;
+    std::fs::write(
+        repo_dir.join("src").join("retry.py"),
+        b"def retry(fn, times=3, cancelled=None):\n    if cancelled:\n        raise TimeoutError()\n    return fn()\n",
+    )?;
     std::fs::create_dir_all(repo_dir.join("tests"))?;
-    std::fs::write(repo_dir.join("tests").join("test_retry.py"), b"def test_retry():\n    assert retry(lambda: 1) == 1\n")?;
+    // RC08: the demo check must be a REAL behavioral assertion — it calls
+    // the retry function and verifies the cancellation contract. Breaking
+    // the source makes it fail; it is never an `exit 0` probe.
+    std::fs::write(
+        repo_dir.join("tests").join("test_retry.py"),
+        b"import sys\nsys.path.insert(0, 'src')\nfrom retry import retry\n\nassert retry(lambda: 1) == 1\ntry:\n    retry(lambda: 1, cancelled=True)\n    print('FAIL: cancellation did not raise')\n    sys.exit(1)\nexcept TimeoutError:\n    pass\nprint('demo retry behaviour ok')\n",
+    )?;
     run(&["add", "."])?;
     run(&["commit", "-qm", "demo base"])?;
 
@@ -160,35 +190,43 @@ pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
         true,
     )?;
 
-    // A real local check: cmd.exe /c exit 0 (always available on Windows).
-    let check_exe = if cfg!(windows) {
-        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\\Windows\\System32\\cmd.exe".into())
+    // RC08: the demo check runs the REAL behavioral test above with the
+    // machine's Python. When no Python exists the demo honestly ships
+    // WITHOUT a profile (the UI says so) — a smoke-only `exit 0` check is
+    // never presented as retry verification.
+    if let Some(python) = find_python_exe() {
+        let demo_rev = ctx.store.task_int(&task_id, "revision")?;
+        let test_script = repo_dir.join("tests").join("test_retry.py");
+        let profile = save_profile(
+            ctx,
+            &task_id,
+            "demo-checks",
+            vec![CheckStep {
+                id: "demo-retry-test".into(),
+                exe: python.to_string_lossy().into_owned(),
+                // -B: no bytecode cache writes — the check stays read-only
+                // on the snapshot copy (a real run invalidated once through
+                // __pycache__; see the RC08 gate evidence).
+                args: vec!["-B".into(), test_script.to_string_lossy().into_owned()],
+                cwd_relative: String::new(),
+                timeout_seconds: 60,
+                required: true,
+            }],
+            vec![],
+            vec![],
+            demo_rev,
+        )?;
+        ctx.store.set_profile_trusted(&profile.id, true)?;
+        let _ = ctx.store.append_event(
+            "demo.check_profile",
+            &serde_json::json!({"kind": "real-assertion", "check": "demo-retry-test"}),
+        );
     } else {
-        "/bin/sh".into()
-    };
-    let check_args: Vec<String> = if cfg!(windows) {
-        vec!["/c".into(), "exit".into(), "0".into()]
-    } else {
-        vec!["-c".into(), "exit 0".into()]
-    };
-    let demo_rev = ctx.store.task_int(&task_id, "revision")?;
-    let profile = save_profile(
-        ctx,
-        &task_id,
-        "demo-checks",
-        vec![CheckStep {
-            id: "demo-check".into(),
-            exe: check_exe,
-            args: check_args,
-            cwd_relative: String::new(),
-            timeout_seconds: 60,
-            required: true,
-        }],
-        vec![],
-        vec![],
-        demo_rev,
-    )?;
-    ctx.store.set_profile_trusted(&profile.id, true)?;
+        let _ = ctx.store.append_event(
+            "demo.check_profile",
+            &serde_json::json!({"kind": "none", "reason": "no python found; demo ships without a check profile"}),
+        );
+    }
     // Demo attestation: the service created this empty repo itself; no
     // external tool could be writing it (documented in the UI copy).
     let cap_rev = ctx.store.task_int(&task_id, "revision")?;

@@ -95,8 +95,6 @@ Schemas: [`schemas/receipt.schema.json`](schemas/receipt.schema.json),
 [`schemas/manifest.schema.json`](schemas/manifest.schema.json). API surface
 and error codes: [`docs/api.md`](docs/api.md).
 
-![Handoff preview, light theme, Chinese](docs/img/handoff-light-zh-preview.png)
-
 ## Trust copy
 
 These statements are enforced by the product, not just written here:

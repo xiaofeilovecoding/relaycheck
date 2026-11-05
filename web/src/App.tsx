@@ -36,6 +36,7 @@ export function App() {
     taskId: null,
   });
   const eventsHead = useRef(0);
+  const [detailTick, setDetailTick] = useState(0);
   const t = dict[lang];
 
   const setLang = (l: Lang) => {
@@ -123,6 +124,12 @@ export function App() {
         refresh();
       };
       es.onmessage = onEvent;
+      const bump = () => setDetailTick((x) => x + 1);
+      // RC05: every event also refreshes the currently open task detail.
+      const esRef = es;
+      ["task.created","task.updated","task.captured","task.checked","task.handoff_exported",
+       "task.imported","task.accepted","task.candidate_confirmed","project.claimed","check.step",
+       "task.profile_saved","operation.done"].forEach((k) => esRef?.addEventListener(k, bump));
       es.addEventListener("task.created", onEvent);
       es.addEventListener("task.updated", onEvent);
       es.addEventListener("task.captured", onEvent);
@@ -288,6 +295,7 @@ export function App() {
             lang={lang}
             onBack={() => setRoute({ view: route.view, taskId: null })}
             onChanged={refresh}
+            detailTick={detailTick}
           />
         ) : (
           <EmptyState t={t} lang={lang} projects={state?.projects ?? []} onClaim={claimProject} onDemo={createDemo} />
