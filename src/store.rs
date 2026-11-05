@@ -1088,7 +1088,7 @@ impl Store {
         let n = conn.execute(
             "UPDATE operations SET state='interrupted',
                 error_json=json_object('code','E_STOP_UNCONFIRMED','message','service restarted while operation was active; rerun manually'),
-                updated_at_ms=?2
+                updated_at_ms=?1
              WHERE state IN ('pending','running','stopping','cancelling')",
             params![now_ms()],
         )?;

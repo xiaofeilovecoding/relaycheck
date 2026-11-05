@@ -18,6 +18,7 @@ use crate::zipx;
 use std::path::Path;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct Ctx {
     pub store: Arc<Store>,
     pub blobs: Arc<BlobStore>,
@@ -181,6 +182,7 @@ pub struct CaptureRequest {
     pub attest_stopped: bool,
 }
 
+#[derive(Debug)]
 pub struct CaptureResult {
     pub snapshot_id: String,
     pub file_count: usize,
@@ -238,6 +240,21 @@ pub fn run_capture(ctx: &Ctx, req: &CaptureRequest, op_id: &str) -> RelayResult<
         parent_opt,
         "selected_sources",
     )?;
+    // Dirty = the captured bytes differ from the index (HEAD's view) for any
+    // tracked file, or untracked files were selected. Computed WITHOUT ever
+    // running `git status` (clean-filter execution hazard, see gitx.rs).
+    let captured: std::collections::HashMap<String, String> = ctx
+        .store
+        .snapshot_files(&outcome.snapshot_id)
+        .map(|fs| fs.into_iter().map(|f| (f.path, f.sha256)).collect())
+        .unwrap_or_default();
+    let dirty = !req.untracked_selected.is_empty()
+        || plan.included.iter().any(|p| {
+            plan.index_shas
+                .get(p)
+                .map(|idx_sha| captured.get(p).map(|c| c != idx_sha).unwrap_or(true))
+                .unwrap_or(false)
+        });
     if ctx.store.snapshot_exists(&outcome.snapshot_id) {
         // Identical content: reuse the immutable snapshot.
     } else {
@@ -248,7 +265,7 @@ pub fn run_capture(ctx: &Ctx, req: &CaptureRequest, op_id: &str) -> RelayResult<
             &project_id,
             &plan.base_head,
             parent_opt,
-            plan.dirty,
+            dirty,
             &manifest,
             &outcome.manifest_json,
             &manifest_sha,
@@ -349,6 +366,7 @@ pub struct VerifyRequest {
     pub trust_confirmed: bool,
 }
 
+#[derive(Debug)]
 pub struct VerifyResult {
     pub verification_id: String,
     pub round_status: String,
@@ -393,11 +411,12 @@ pub fn run_verify(ctx: &Ctx, req: &VerifyRequest, cancel: &checks::CancelFlag, o
         .collect();
     // Blob integrity gate: corrupt store bars checks (spec §4).
     for (_, sha) in &files {
-        if !ctx.blobs.exists(sha) {
+        if let Err(e) = ctx.blobs.verify(sha) {
             return Err(RelayError::new(
                 Code::ECorrupt,
                 "snapshot blobs are incomplete; checks and acceptance are disabled for this candidate",
-            ));
+            )
+            .with_details(vec![format!("blob={} ({})", &sha[..12.min(sha.len())], e.message)]));
         }
     }
     let rev = ctx.store.task_int(task_id, "revision")?;
@@ -590,6 +609,7 @@ pub fn create_handoff(ctx: &Ctx, req: &HandoffRequest) -> RelayResult<(String, S
 // Import
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct ImportOutcome {
     pub imported_report_id: String,
     pub association: String, // linked | pending_manual
@@ -619,6 +639,7 @@ pub fn import_package(ctx: &Ctx, data: &[u8], task_id: Option<&str>) -> RelayRes
             excluded: pack.manifest.excluded.clone(),
             base_head: pack.receipt.base_head.clone(),
             dirty: false,
+            index_shas: Default::default(),
         };
         // Recompute the manifest canonically; it must equal the packaged one.
         let outcome = capture::capture_from_paths(&pack.quarantine_dir, &plan, &ctx.blobs, None, "selected_sources")?;
@@ -657,12 +678,8 @@ pub fn import_package(ctx: &Ctx, data: &[u8], task_id: Option<&str>) -> RelayRes
         // The parent handoff must exist and be a formal (non-draft) export.
         match ctx.store.handoff_json(parent) {
             Ok(h) => {
-                if h.get("candidate_snapshot").and_then(|v| v.as_str()) != Some(pack.receipt.base_head.as_str())
-                    && pack.receipt.base_head.is_empty()
-                {
-                    // base_head empty is not valid for returns; caught below.
-                }
-                let _ = h;
+                // An explicit task binding from the caller wins; otherwise
+                // the parent handoff's task is the link target.
                 if linked_task.is_none() {
                     linked_task = h.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
                 }
@@ -677,8 +694,10 @@ pub fn import_package(ctx: &Ctx, data: &[u8], task_id: Option<&str>) -> RelayRes
                 }
             }
             Err(_) => {
+                // Unknown parent: association stays pending_manual, but a
+                // caller-specified task binding is preserved so the report
+                // is visible (read-only) inside that task.
                 association = "pending_manual".to_string();
-                linked_task = None; // never auto-link to an unknown parent
             }
         }
     }
@@ -846,10 +865,10 @@ pub fn acceptance_check(ctx: &Ctx, task_id: &str) -> RelayResult<AcceptCheck> {
             )),
         }
     }
-    // Corrupt blobs bar acceptance.
+    // Corrupt blobs bar acceptance (content-verified, not just present).
     for f in ctx.store.snapshot_files(&active)? {
-        if !ctx.blobs.exists(&f.sha256) {
-            missing.push("snapshot blobs incomplete".into());
+        if ctx.blobs.verify(&f.sha256).is_err() {
+            missing.push("snapshot blobs incomplete or corrupted".into());
             break;
         }
     }

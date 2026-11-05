@@ -64,6 +64,9 @@ pub struct CapturePlan {
     pub excluded: Vec<ExcludedEntry>,
     pub base_head: String,
     pub dirty: bool,
+    /// Index blob hash per tracked path (HEAD's view). Empty for
+    /// non-git sources (import quarantine packs).
+    pub index_shas: std::collections::HashMap<String, String>,
 }
 
 /// Builds the file selection for a capture: tracked files by default plus
@@ -76,11 +79,16 @@ pub fn plan_capture(
     extra_excludes: &[String],
 ) -> RelayResult<CapturePlan> {
     let tracked = gitx::ls_files_cached(repo_root, isolated_home)?;
+    let index_shas: std::collections::HashMap<String, String> =
+        tracked.iter().map(|(m, sha, p)| (p.clone(), sha.clone())).collect();
     let untracked = gitx::ls_untracked(repo_root, isolated_home)?;
     let base_head_bytes = gitx::git_run(repo_root, &["rev-parse", "HEAD"], isolated_home)
         .unwrap_or_default();
     let base_head = String::from_utf8_lossy(&base_head_bytes).trim().to_string();
-    let dirty = gitx::is_dirty(repo_root, isolated_home)?;
+    // dirty=false here; the flag is derived from captured content vs index
+    // hashes after the copy (see run_capture in service.rs). git status is
+    // banned here: it executes .gitattributes clean filters (see gitx.rs).
+    let dirty = false;
 
     let mut selected: Vec<String> = Vec::new();
     let mut excluded: Vec<ExcludedEntry> = Vec::new();
@@ -99,7 +107,7 @@ pub fn plan_capture(
     let _ = untracked_set;
 
     let mut all: Vec<String> = Vec::new();
-    for (_, p) in tracked {
+    for (_, _, p) in tracked {
         all.push(p);
     }
     for p in untracked_selected {
@@ -151,7 +159,7 @@ pub fn plan_capture(
         selected.push(rel);
     }
     selected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    Ok(CapturePlan { included: selected, excluded, base_head, dirty })
+    Ok(CapturePlan { included: selected, excluded, base_head, dirty, index_shas })
 }
 
 fn safe_rel(p: &str) -> String {

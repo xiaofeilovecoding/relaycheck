@@ -131,6 +131,20 @@ impl BlobStore {
         self.path_for(sha256).exists()
     }
 
+    /// Streaming content verification: the blob must exist AND hash-match.
+    /// Existence alone is not integrity (a tampered file would pass).
+    pub fn verify(&self, sha256: &str) -> RelayResult<()> {
+        let p = self.path_for(sha256);
+        if !p.exists() {
+            return Err(RelayError::new(Code::ECorrupt, "blob missing"));
+        }
+        let actual = crate::ids::sha256_file(&p)?;
+        if actual != sha256 {
+            return Err(RelayError::new(Code::ECorrupt, "blob hash mismatch"));
+        }
+        Ok(())
+    }
+
     pub fn size_of(&self, sha256: &str) -> RelayResult<i64> {
         Ok(std::fs::metadata(self.path_for(sha256))?.len() as i64)
     }

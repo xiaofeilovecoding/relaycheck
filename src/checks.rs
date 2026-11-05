@@ -1148,39 +1148,24 @@ fn finish_record(
     results.sort_by(|a, b| a.check_id.cmp(&b.check_id));
     let required: Vec<&crate::model::CheckStep> =
         profile.checks.iter().filter(|c| c.required).collect();
+    // Round verdict priority: any invalidation poisons the whole round
+    // (output-scope / input-integrity pseudo-checks included, spec R05);
+    // then a blocked required step; then a failed required check; then all
+    // required passed; anything incomplete is interrupted.
+    let status_of = |id: &str| results.iter().find(|r| r.check_id == id).map(|r| r.status.as_str());
     let round_status: String = if let Some(f) = force_status {
         f.to_string()
+    } else if results.iter().any(|r| r.status == "invalidated") {
+        "invalidated".to_string()
+    } else if !required.is_empty() && required.iter().any(|c| status_of(&c.id) == Some("blocked")) {
+        "blocked".to_string()
+    } else if !required.is_empty() && required.iter().any(|c| status_of(&c.id) == Some("failed")) {
+        "failed".to_string()
+    } else if !required.is_empty() && required.iter().all(|c| status_of(&c.id) == Some("passed")) {
+        "passed".to_string()
     } else if required.is_empty() {
         // No required checks: the round can hand off but never gates
         // ready_for_review/acceptance (spec §3).
-        "passed".to_string()
-    } else if required.iter().any(|c| {
-        matches!(
-            results.iter().find(|r| r.check_id == c.id).map(|r| r.status.as_str()),
-            Some("invalidated")
-        )
-    }) {
-        "invalidated".to_string()
-    } else if required.iter().any(|c| {
-        matches!(
-            results.iter().find(|r| r.check_id == c.id).map(|r| r.status.as_str()),
-            Some("blocked")
-        )
-    }) {
-        "blocked".to_string()
-    } else if required.iter().any(|c| {
-        matches!(
-            results.iter().find(|r| r.check_id == c.id).map(|r| r.status.as_str()),
-            Some("failed")
-        )
-    }) {
-        "failed".to_string()
-    } else if required.iter().all(|c| {
-        matches!(
-            results.iter().find(|r| r.check_id == c.id).map(|r| r.status.as_str()),
-            Some("passed")
-        )
-    }) {
         "passed".to_string()
     } else {
         "interrupted".to_string()

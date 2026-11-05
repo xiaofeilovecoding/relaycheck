@@ -20,7 +20,7 @@ fn r01_full_relay_loop_with_return_capture_and_accept() {
     let (_project, task_id) = setup_project_task(&env, &repo, "Fix the retry boundary");
 
     // 1. Capture candidate A.
-    let a = capture_all(&env, &task_id);
+    let a = capture_all(&env, &task_id).expect("capture");
     assert_eq!(a.file_count, 2, "tracked files captured");
     let task = env.ctx.store.task_snapshot(&task_id).unwrap();
     assert_eq!(task["workflow_state"], "candidate");
@@ -67,7 +67,7 @@ fn r01_full_relay_loop_with_return_capture_and_accept() {
     // From here on, only PRODUCT operations run: repo refs/index/dirty must
     // not change during capture/verify/accept themselves.
     let before_product = repo.state_fingerprint();
-    let b = capture_all(&env, &task_id);
+    let b = capture_all(&env, &task_id).expect("capture");
     assert_ne!(a.snapshot_id, b.snapshot_id);
     assert!(b.is_return, "capturing while a handoff is outstanding marks the return");
 
@@ -110,7 +110,7 @@ fn r01_return_import_portable_source_becomes_verified_candidate_flow() {
     repo.git(&["commit", "-qm", "base"]);
     let (_p, task_id) = setup_project_task(&env, &repo, "验证中文路径接力");
 
-    let a = capture_all(&env, &task_id);
+    let a = capture_all(&env, &task_id).expect("capture");
     assert_eq!(a.file_count, 2);
 
     let script = "import sys\nsys.exit(0)\n";
@@ -167,6 +167,7 @@ fn r01_return_import_portable_source_becomes_verified_candidate_flow() {
         excluded: vec![],
         base_head: String::new(),
         dirty: false,
+        index_shas: Default::default(),
     };
     let outcome = relaycheck::capture::capture_from_paths(
         &workdir, &plan, &env.ctx.blobs, None, "selected_sources",
@@ -238,14 +239,14 @@ fn r01_accept_history_survives_new_capture_b() {
     repo.git(&["add", "."]);
     repo.git(&["commit", "-qm", "v1"]);
     let (_p, task_id) = setup_project_task(&env, &repo, "accept then continue");
-    let a = capture_all(&env, &task_id);
+    let a = capture_all(&env, &task_id).expect("capture");
     let _ = setup_python_profile(&env, &task_id, "import sys\nsys.exit(0)\n", "c1");
     verify_now(&env, &task_id);
     let rev = env.ctx.store.task_int(&task_id, "revision").unwrap();
     service::accept_candidate(&env.ctx, &task_id, &["SC1".to_string()], rev).unwrap();
 
     repo.write("f.txt", b"v2\n");
-    let b = capture_all(&env, &task_id);
+    let b = capture_all(&env, &task_id).expect("capture");
     assert_ne!(a.snapshot_id, b.snapshot_id);
     let task = env.ctx.store.task_snapshot(&task_id).unwrap();
     assert_eq!(task["workflow_state"], "candidate");

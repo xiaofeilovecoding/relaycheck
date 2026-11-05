@@ -88,6 +88,7 @@ fn add_file(
 // Import validation
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct ValidatedPackage {
     pub receipt: Receipt,
     pub manifest: SnapshotManifest,

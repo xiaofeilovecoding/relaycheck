@@ -240,7 +240,7 @@ pub fn setup_python_profile(
 }
 
 /// Captures with default scope (all tracked files).
-pub fn capture_all(env: &TestEnv, task_id: &str) -> relaycheck::service::CaptureResult {
+pub fn capture_all(env: &TestEnv, task_id: &str) -> relaycheck::errors::RelayResult<relaycheck::service::CaptureResult> {
     let op_id = "test-capture-op";
     let _ = env.ctx.store.insert_operation(op_id, "capture", Some(task_id), None, "");
     let cancel = env.ctx.ops.begin(op_id, "capture").expect("begin capture");
@@ -256,7 +256,15 @@ pub fn capture_all(env: &TestEnv, task_id: &str) -> relaycheck::service::Capture
     );
     env.ctx.ops.finish(op_id);
     let _ = cancel;
-    result.expect("capture")
+    match &result {
+        Ok(_) => {
+            env.ctx.store.update_operation(op_id, "completed", Some("{}"), None).ok();
+        }
+        Err(_) => {
+            env.ctx.store.update_operation(op_id, "failed", None, Some("{}")).ok();
+        }
+    }
+    result
 }
 
 /// Runs a verify round to completion.
@@ -272,6 +280,10 @@ pub fn verify_now(env: &TestEnv, task_id: &str) -> relaycheck::service::VerifyRe
         |_| {},
     );
     env.ctx.ops.finish(op_id);
+    match &result {
+        Ok(_) => { env.ctx.store.update_operation(op_id, "completed", Some("{}"), None).ok(); }
+        Err(_) => { env.ctx.store.update_operation(op_id, "failed", None, Some("{}"), ).ok(); }
+    }
     result.expect("verify")
 }
 

@@ -59,8 +59,17 @@ fn run_git(repo_root: &Path, args: &[&str], isolated_home: &Path) -> RelayResult
         .arg("--no-optional-locks")
         .arg("-c")
         .arg("core.fsmonitor=false")
+        // Hooks MUST be pinned to an isolated empty directory: an empty
+        // value makes git fall back to <repo>/.git/hooks (attacker-writable).
+        // see tests/r09_malicious_git.rs
         .arg("-c")
-        .arg("core.hooksPath=")
+        .arg(format!(
+            "core.hooksPath={}",
+            isolated_home
+                .join("hooks-empty")
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        ))
         .arg("-c")
         .arg("core.editor=true")
         .arg("-c")
@@ -113,6 +122,7 @@ pub fn git_run(repo_root: &str, args: &[&str], isolated_home: &Path) -> RelayRes
     Ok(out.stdout)
 }
 
+#[derive(Debug)]
 pub struct RepoIdentity {
     pub root: String,
     pub common_dir: String,
@@ -143,14 +153,18 @@ pub fn identify(repo_root: &str, isolated_home: &Path) -> RelayResult<RepoIdenti
     Ok(RepoIdentity { root, common_dir: common, head_commit })
 }
 
-/// Lists tracked files with stage info (mode + path), rejecting gitlinks.
-/// Output is NUL-delimited: `<mode> <hash> <stage>\0<path>\0`.
-pub fn ls_files_cached(repo_root: &str, isolated_home: &Path) -> RelayResult<Vec<(String, String)>> {
+/// Lists tracked files with stage info (mode + index blob sha + path),
+/// rejecting gitlinks. Output is NUL-delimited:
+/// `<mode> <hash> <stage>\0<path>\0`.
+pub fn ls_files_cached(
+    repo_root: &str,
+    isolated_home: &Path,
+) -> RelayResult<Vec<(String, String, String)>> {
     let out = git_run(repo_root, &["ls-files", "-z", "--stage"], isolated_home)?;
     parse_ls_files_stage(&out)
 }
 
-pub fn parse_ls_files_stage(data: &[u8]) -> RelayResult<Vec<(String, String)>> {
+pub fn parse_ls_files_stage(data: &[u8]) -> RelayResult<Vec<(String, String, String)>> {
     let mut out = Vec::new();
     for rec in data.split(|b| *b == 0) {
         if rec.is_empty() {
@@ -162,13 +176,14 @@ pub fn parse_ls_files_stage(data: &[u8]) -> RelayResult<Vec<(String, String)>> {
         };
         let mut parts = meta.split_whitespace();
         let mode = parts.next().unwrap_or("");
+        let sha = parts.next().unwrap_or("");
         if mode == "160000" {
             return Err(RelayError::validation(format!(
                 "submodule entry is not supported for capture: {}",
                 relative_display(path)
             )));
         }
-        out.push((mode.to_string(), path.to_string()));
+        out.push((mode.to_string(), sha.to_string(), path.to_string()));
     }
     Ok(out)
 }
@@ -190,11 +205,12 @@ pub fn ls_untracked(repo_root: &str, isolated_home: &Path) -> RelayResult<Vec<St
     Ok(parse_ls_files_null(&out))
 }
 
-/// Dirty flag: any working-tree difference from HEAD (porcelain v1 non-empty).
-pub fn is_dirty(repo_root: &str, isolated_home: &Path) -> RelayResult<bool> {
-    let out = git_run(repo_root, &["status", "--porcelain"], isolated_home)?;
-    Ok(!out.is_empty())
-}
+// NOTE: git status is deliberately NOT whitelisted. On a modified file it
+// re-hashes worktree content to print the M marker, which EXECUTES any clean
+// filter declared for that path in .gitattributes (verified by our fixture probe):
+// a 'read-only' command becomes arbitrary code execution. Dirty-ness is
+// derived by comparing index blob hashes (ls-files --stage) with captured
+// content hashes instead — see capture.rs.
 
 /// Returns the LFS filter attribute for each listed path (empty string when
 /// unspecified). `filter=lfs` on a selected file means remote LFS dependency
@@ -227,6 +243,8 @@ fn relative_display(p: &str) -> &str {
 pub fn isolated_home(base: &Path) -> RelayResult<PathBuf> {
     let dir = base.join("git-isolated-home");
     std::fs::create_dir_all(&dir)?;
+    // The hooks pin target must exist and stay empty.
+    std::fs::create_dir_all(dir.join("hooks-empty"))?;
     Ok(dir)
 }
 
@@ -241,6 +259,7 @@ mod tests {
         let data = b"100644 abc\tfile.txt\0100755 def\trun.sh\0".to_vec();
         let v = parse_ls_files_stage(&data).unwrap();
         assert_eq!(v.len(), 2);
-        assert_eq!(v[0].1, "file.txt");
+        assert_eq!(v[0].2, "file.txt");
+        assert_eq!(v[0].1, "abc");
     }
 }
