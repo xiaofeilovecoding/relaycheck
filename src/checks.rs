@@ -479,75 +479,139 @@ mod winproc {
 #[cfg(windows)]
 use winproc::{close_read, drain_pipe, make_pipes, spawn_in_job, Job, PipeHandle, Pipes};
 
-#[cfg(unix)]
-mod unxproc {
-    use super::*;
-    use std::process::{Child, Command, Stdio};
-
-    pub struct Job {
-        pub child: Child,
-    }
-
-    unsafe impl Send for Job {}
-
-    impl Job {
-        pub fn kill(&self) {
-            // Process-group kill (children were spawned in our group by the
-            // preexec setpgid below).
-            unsafe {
-                libc::killpg(self.child.id() as i32, libc::SIGKILL);
-            }
-            self.child.kill().ok();
-        }
-
-        pub fn wait(&mut self, timeout_ms: u32) -> bool {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
-            loop {
-                match self.child.try_wait() {
-                    Ok(Some(_)) => return true,
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            return false;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    Err(_) => return false,
-                }
-            }
-        }
-
-        pub fn exit_code(&self) -> Option<i32> {
-            self.child.try_wait().ok().flatten().and_then(|s| s.code())
+fn merge_output(mut out: Vec<u8>, err: Vec<u8>, mut truncated: bool) -> (Vec<u8>, bool) {
+    if !err.is_empty() {
+        for part in [b"\\n[stderr]\\n".as_slice(), err.as_slice()] {
+            let take = OUTPUT_CAP_BYTES.saturating_sub(out.len()).min(part.len());
+            out.extend_from_slice(&part[..take]);
+            truncated |= take < part.len();
         }
     }
-
-    pub fn spawn_in_job(
-        exe: &str,
-        args: &[String],
-        cwd: &Path,
-        env: &[(String, String)],
-    ) -> RelayResult<(Job, std::process::ChildStdout, std::process::ChildStderr)> {
-        let mut cmd = Command::new(exe);
-        cmd.args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-        cmd.env_clear();
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        let child = cmd.spawn().map_err(|e| RelayError::internal(format!("spawn failed: {e}")))?;
-        let out = child.stdout.take().unwrap();
-        let err = child.stderr.take().unwrap();
-        Ok((Job { child }, out, err))
-    }
+    (out, truncated)
 }
 
 #[cfg(unix)]
-use unxproc::spawn_in_job;
+mod unxproc {
+    use super::*;
+    use std::io::{self, Read};
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn drain(pipe: &mut impl Read, buf: &mut Vec<u8>, truncated: &mut bool) -> bool {
+        let mut chunk = [0; 65536];
+        let mut read_data = false;
+        // Keep polling the deadline even if the child continuously floods a pipe.
+        for _ in 0..8 {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    read_data = true;
+                    let take = (OUTPUT_CAP_BYTES - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                    *truncated |= take < n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        read_data
+    }
+
+    pub fn run(
+        exe: &str, args: &[String], cwd: &Path, env: &[(String, String)],
+        start: Instant, timeout_ms: u64, cancel: &CancelFlag,
+    ) -> io::Result<ProcOutcome> {
+        let mut child = Command::new(exe)
+            .args(args).current_dir(cwd).env_clear().envs(env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .process_group(0).spawn()?;
+        let group = child.id() as i32;
+        let kill_group = || unsafe { libc::killpg(group, libc::SIGKILL) };
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        if let Err(e) = nonblocking(&stdout).and_then(|_| nonblocking(&stderr)) {
+            kill_group();
+            let _ = child.wait();
+            return Err(e);
+        }
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut truncated = false;
+        let deadline = start + Duration::from_millis(timeout_ms);
+        let mut timed_out = false;
+        let mut killed_at = None;
+        let status = loop {
+            let reading = drain(&mut stdout, &mut out, &mut truncated)
+                | drain(&mut stderr, &mut err, &mut truncated);
+            // Observe the exit without reaping, so the process group ID
+            // cannot be recycled between observing exit and killing descendants.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let observed = unsafe {
+                libc::waitid(libc::P_PID, group as libc::id_t, &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
+            };
+            if observed < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break None;
+            }
+            if unsafe { info.si_pid() } != 0 {
+                if killed_at.is_none() {
+                    kill_group();
+                }
+                break child.wait().ok();
+            }
+            let now = Instant::now();
+            if let Some(killed) = killed_at {
+                if now - killed >= Duration::from_millis(STOP_GRACE_MS) {
+                    break None;
+                }
+            } else if cancel.is_cancelled() || now >= deadline {
+                timed_out = !cancel.is_cancelled();
+                kill_group();
+                killed_at = Some(now);
+            }
+            if !reading {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        drain(&mut stdout, &mut out, &mut truncated);
+        drain(&mut stderr, &mut err, &mut truncated);
+        let (output, output_truncated) = merge_output(out, err, truncated);
+        let (redacted, redactions) = secrets::redact_bytes(&output);
+        Ok(ProcOutcome {
+            exit_code: status.and_then(|s| s.code()),
+            timed_out,
+            stop_confirmed: status.is_some(),
+            output: redacted.into_bytes(),
+            output_truncated,
+            redactions,
+        })
+    }
+
+    #[test]
+    fn timeout_interrupts_a_child_with_open_output_pipes() {
+        let started = Instant::now();
+        let result = run(
+            "/bin/sh", &["-c".into(), "printf started; /bin/sleep 30 & wait".into()],
+            &std::env::temp_dir(), &[], started, 500, &CancelFlag::new(),
+        ).unwrap();
+        assert!(result.timed_out && result.stop_confirmed);
+        assert_eq!(result.output, b"started");
+        assert!(started.elapsed() < Duration::from_secs(8));
+    }
+
+}
 
 fn run_step(
     exe: &str,
@@ -624,18 +688,7 @@ fn run_step(
         job.close();
         let (out, out_trunc1) = t_out.join().unwrap_or_default();
         let (err, out_trunc2) = t_err.join().unwrap_or_default();
-        let mut output = out;
-        let mut output_truncated = out_trunc1 || out_trunc2;
-        if !err.is_empty() {
-            output.extend_from_slice(b"\n[stderr]\n");
-            if output.len() + err.len() <= OUTPUT_CAP_BYTES {
-                output.extend_from_slice(&err);
-            } else {
-                let take = OUTPUT_CAP_BYTES - output.len();
-                output.extend_from_slice(&err[..take.max(0)]);
-                output_truncated = true;
-            }
-        }
+        let (output, output_truncated) = merge_output(out, err, out_trunc1 || out_trunc2);
         let (redacted, redactions) = secrets::redact_bytes(&output);
         ProcOutcome {
             exit_code,
@@ -649,105 +702,14 @@ fn run_step(
 
     #[cfg(unix)]
     {
-        match spawn_in_job(exe, args, cwd, &env) {
-            Err(e) => ProcOutcome {
-                exit_code: None,
-                timed_out: false,
-                stop_confirmed: true,
-                output: format!("[relaycheck] spawn failed: {}", e.message).into_bytes(),
-                output_truncated: false,
-                redactions: 0,
-            },
-            Ok((mut job, stdout, stderr)) => {
-                use std::io::Read;
-                let mut out_buf: Vec<u8> = Vec::new();
-                let mut truncated = false;
-                let mut collect = |r: &mut dyn Read, buf: &mut Vec<u8>, trunc: &mut bool| {
-                    let mut chunk = [0u8; 65536];
-                    loop {
-                        match r.read(&mut chunk) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if buf.len() < OUTPUT_CAP_BYTES {
-                                    let take = (OUTPUT_CAP_BYTES - buf.len()).min(n);
-                                    buf.extend_from_slice(&chunk[..take]);
-                                    if take < n {
-                                        *trunc = true;
-                                    }
-                                } else {
-                                    *trunc = true;
-                                }
-                            }
-                        }
-                    }
-                };
-                let t_err = {
-                    let mut stderr = stderr;
-                    std::thread::spawn(move || {
-                        let mut buf: Vec<u8> = Vec::new();
-                        let mut trunc = false;
-                        let mut chunk = [0u8; 65536];
-                        loop {
-                            match stderr.read(&mut chunk) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if buf.len() < OUTPUT_CAP_BYTES {
-                                        let take = (OUTPUT_CAP_BYTES - buf.len()).min(n);
-                                        buf.extend_from_slice(&chunk[..take]);
-                                        if take < n {
-                                            trunc = true;
-                                        }
-                                    } else {
-                                        trunc = true;
-                                    }
-                                }
-                            }
-                        }
-                        (buf, trunc)
-                    })
-                };
-                collect(&mut stdout, &mut out_buf, &mut truncated);
-
-                let deadline = start + std::time::Duration::from_millis(timeout_ms);
-                let mut timed_out = false;
-                let mut killed = false;
-                loop {
-                    if job.wait(100) {
-                        break;
-                    }
-                    if cancel.is_cancelled() {
-                        job.kill();
-                        killed = true;
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        job.kill();
-                        timed_out = true;
-                        killed = true;
-                        break;
-                    }
-                }
-                let stop_confirmed = if killed { job.wait(STOP_GRACE_MS as u32) } else { true };
-                let exit_code = job.exit_code();
-                let _ = job.child.wait();
-                let (err, err_trunc) = t_err.join().unwrap_or_default();
-                if !err.is_empty() {
-                    out_buf.extend_from_slice(b"\n[stderr]\n");
-                    let take = (OUTPUT_CAP_BYTES - out_buf.len()).min(err.len());
-                    out_buf.extend_from_slice(&err[..take.max(0)]);
-                }
-                truncated = truncated || err_trunc;
-                let (redacted, redactions) = secrets::redact_bytes(&out_buf);
-                ProcOutcome {
-                    exit_code,
-                    timed_out,
-                    stop_confirmed,
-                    output: redacted.into_bytes(),
-                    output_truncated: truncated,
-                    redactions,
-                }
-            }
-        }
+        unxproc::run(exe, args, cwd, &env, start, timeout_ms, cancel).unwrap_or_else(|e| ProcOutcome {
+            exit_code: None,
+            timed_out: false,
+            stop_confirmed: true,
+            output: format!("[relaycheck] spawn failed: {e}").into_bytes(),
+            output_truncated: false,
+            redactions: 0,
+        })
     }
 }
 

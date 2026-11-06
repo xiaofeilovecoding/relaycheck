@@ -27,7 +27,7 @@ apply/merge/push，也不认证包的发送者——哈希绑定的是内容，�
 
 | | |
 |---|---|
-| 平台 | 本机已验证 Windows 10 x64。GitHub Actions 在 Windows 和 Linux 上运行检查。 |
+| 平台 | 支持 Windows x64。CI 在 Windows 上完整验证 CLI 和 Web；Ubuntu 运行前端构建和可移植 Rust 单元测试。 |
 | 安装 | 无——单可执行文件，用你已有的 Git 和 Python |
 | 网络 | 仅 localhost；无账号、无 API Key |
 | 数据 | SQLite + 内容寻址 blob，存放在你的数据目录 |

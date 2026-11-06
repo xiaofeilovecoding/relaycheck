@@ -185,7 +185,7 @@ fn r05_output_truncation_marks_flag_and_keeps_verdict() {
     let _ = capture_all(&env, &task_id);
     // ~2 MiB of output then exit 0 → truncated flag, verdict passed.
     let script = format!(
-        "import sys\nsys.stdout.write('x' * {})\nsys.stdout.flush()\nsys.exit(0)\n",
+        "import sys\nsys.stdout.write('x' * {})\nsys.stdout.flush()\nsys.stderr.write('stderr tail')\nsys.exit(0)\n",
         2 * 1024 * 1024
     );
     let _ = setup_python_profile(&env, &task_id, &script, "chatty");

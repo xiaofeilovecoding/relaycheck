@@ -32,7 +32,7 @@ not authenticate who sent a package — hashes bind content, not senders.
 
 | | |
 |---|---|
-| Platforms | Windows 10 x64 verified locally. GitHub Actions runs Windows and Linux checks. |
+| Platforms | Windows x64. CI runs the full CLI and Web suite on Windows; Ubuntu runs the frontend build and portable Rust unit tests. |
 | Install | none — one executable, your existing Git and Python |
 | Network | localhost only; no account, no API key |
 | Data | SQLite + content-addressed blobs under your data directory |
