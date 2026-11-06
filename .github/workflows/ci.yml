@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: relaycheck-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   PYTHONUTF8: "1"
@@ -53,14 +53,14 @@ jobs:
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup override set 1.95.0
-          cargo test --locked
+          cargo test --release --locked
           cargo build --release --locked
           python scripts/dependency_notices.py target/THIRD-PARTY-LICENSES.txt
       - name: Install Chromium
         if: runner.os == 'Windows'
         run: |
           python -m pip install playwright==1.64.1
-          python -m playwright install --with-deps chromium
+          python -m playwright install --only-shell chromium
       - name: Verify the production Web UI
         if: runner.os == 'Windows'
         run: python scripts/run_ui_gates.py "target/release/relaycheck.exe" target/ui-gates.json
