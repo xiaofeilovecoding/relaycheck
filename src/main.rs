@@ -157,7 +157,7 @@ fn serve_inner(data_dir: PathBuf, port_override: Option<u16>) -> RelayResult<()>
             port,
             cli_token,
             events_tx: tx,
-            idem: std::sync::Mutex::new(std::collections::HashMap::new()),
+            admission: std::sync::Mutex::new(()),
         });
 
         // One-time bootstrap token; the fragment never reaches server logs.

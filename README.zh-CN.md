@@ -1,5 +1,7 @@
 # RelayCheck
 
+[![CI](https://github.com/xiaofeilovecoding/relaycheck/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaofeilovecoding/relaycheck/actions/workflows/ci.yml) · [English](README.md)
+
 **换工具，接着做；改动与验证对得上。**
 
 RelayCheck 是一个本机小工作区：把编码任务在工具之间交接——文件版本、检查
@@ -12,27 +14,28 @@ RelayCheck 是一个本机小工作区：把编码任务在工具之间交接—
 - **接受你真正检查过的版本。** 通过记录绑定在某个快照上；文件一变，旧通过
   不再算数。
 
-![任务详情，浅色，中文](docs/img/desktop-dark-zh.png)
+![任务详情，深色，中文](docs/img/desktop-dark-zh.png)
 
 ## 它是什么（以及不是什么）
 
 RelayCheck 在本机运行一个服务：登记 Git 项目、捕获候选快照、运行你明确
 批准的检查、导出开放的接手包、把回交的工作作为新候选接回并给出真实变化
-清单。它不会自动调用任何编码工具，任何内容都不会离开这台电脑。
+清单。服务把数据保存在本机。获批的检查命令以你的账户运行，可访问该账户有权访问的资源。
 
 它**不是**任务调度器、不是模型代理、也不是代码质量保证。它不会自动
 apply/merge/push，也不认证包的发送者——哈希绑定的是内容，不是人。
 
 | | |
 |---|---|
-| 平台 | Windows 10 x64（本机实测）；Linux/CI 未实测——如实状态见交付说明 |
+| 平台 | 本机已验证 Windows 10 x64。GitHub Actions 在 Windows 和 Linux 上运行检查。 |
 | 安装 | 无——单可执行文件，用你已有的 Git 和 Python |
 | 网络 | 仅 localhost；无账号、无 API Key |
 | 数据 | SQLite + 内容寻址 blob，存放在你的数据目录 |
 
 ## 快速开始
 
-需要：Windows 10+，PATH 里有 [Git](https://git-scm.com)。只有要运行检查时
+可从通过的 [CI 运行](https://github.com/xiaofeilovecoding/relaycheck/actions/workflows/ci.yml)下载可执行文件，也可按下文从源码构建。
+需要：PATH 里有 [Git](https://git-scm.com)。只有要运行检查时
 才需要 Python（或你批准的其他命令）。
 
 ```text
@@ -107,14 +110,14 @@ relaycheck verify  --task <任务ID> [--json]
 ## 开发
 
 ```text
-cargo test            # 单元 + 集成门禁（R01–R14 套件）
-cd web && npm install && npm run build   # 重新构建内嵌 UI
-cargo build --release
+npm --prefix web ci
+npm --prefix web run build
+cargo test --locked
+cargo build --release --locked
 ```
 
-门禁映射（R01–R21）与截图脚本见 [CONTRIBUTING.md](CONTRIBUTING.md)。这是
-0.1 评审候选——详见交付报告中“尚未验证”的部分。
+先构建前端，Cargo 才能把静态资源嵌入可执行文件。浏览器门禁与贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 许可
 
-MIT —— 见 [NOTICE](NOTICE)。
+[MIT](LICENSE) · [第三方声明](NOTICE)

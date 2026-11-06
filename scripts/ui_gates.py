@@ -13,6 +13,7 @@ Covers (evidence for the review items):
         via an init hook, never by the probe itself; focus return asserted
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -75,7 +76,7 @@ def main():
         # ---- demo journey ----
         click(page, "main button", "试用样例")
         page.wait_for_timeout(4500)
-        click(page, ".task-card", "重试")
+        page.locator(".task-card").first.click()
         page.wait_for_timeout(1800)
 
         # RC06: desktop no overflow
@@ -92,46 +93,13 @@ def main():
             """() => {
             const inputs = [...document.querySelectorAll('.modal input[type=text]')];
             const ta = document.querySelector('.modal textarea[data-testid=args-editor]');
-            return [inputs[0]?.value ?? '', ta?.value ?? ''];
+            return [inputs[1]?.value ?? '', ta?.value ?? ''];
         }"""
         )
-        exe_path = "D:\\demo tools\\我的 检查器.exe"
+        exe_path = r"D:\demo tools\我的 检查器.exe" if os.name == "nt" else "/demo tools/我的 检查器"
         arg_a = 'C:\\path with spaces\\run.py'
         arg_b = '-c'
         arg_c = 'import a; print("x  y")'
-        page.evaluate(
-            """([v1, v2, v3, v4]) => {
-            const set = (el, v) => {
-              const proto = Object.getPrototypeOf(el);
-              Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
-              el.dispatchEvent(new Event('input', { bubbles: true }));
-            };
-            const inputs = [...document.querySelectorAll('.modal input[type=text]')];
-            set(inputs[0], v1);           // exe
-            const ta = document.querySelector('.modal textarea[data-testid=args-editor]');
-            set(ta, v2 + '\\n' + v3 + '\\n' + v4);
-        }""",
-            [exe_path, arg_a, arg_b, arg_c],
-        )
-        click(page, ".modal button", "保存新版本")
-        page.wait_for_timeout(1500)
-        click(page, ".modal button", "批准并运行")
-        page.wait_for_timeout(2500)
-        # Re-open the editor: the argv must round-trip exactly.
-        click(page, "main .check .ghost", "修改检查配置")
-        page.wait_for_timeout(900)
-        args_now = page.evaluate(
-            "() => document.querySelector('.modal textarea[data-testid=args-editor]')?.value ?? ''"
-        )
-        expected = f"{arg_a}\n{arg_b}\n{arg_c}"
-        record("rc07-lossless-argv-roundtrip", args_now == expected, repr(args_now))
-        exe_now = page.evaluate(
-            "() => [...document.querySelectorAll('.modal input[type=text]')][0]?.value ?? ''"
-        )
-        record("rc07-exe-roundtrip", exe_now == exe_path, repr(exe_now))
-        # Restore the demo's real check (fresh modal after Escape).
-        click(page, "main .check .ghost", "修改检查配置")
-        page.wait_for_timeout(900)
         page.evaluate(
             """([v1, v2]) => {
             const set = (el, v) => {
@@ -140,7 +108,41 @@ def main():
               el.dispatchEvent(new Event('input', { bubbles: true }));
             };
             const inputs = [...document.querySelectorAll('.modal input[type=text]')];
-            set(inputs[0], v1);
+            set(inputs[1], v1);           // exe
+            const ta = document.querySelector('.modal textarea[data-testid=args-editor]');
+            set(ta, JSON.stringify(v2));
+        }""",
+            [exe_path, [arg_a, arg_b, arg_c, "", "embedded\nnewline"]],
+        )
+        click(page, ".modal button", "保存新版本")
+        page.wait_for_timeout(1500)
+        args_editor = page.locator('[data-testid="args-editor"]')
+        final_args = [arg_a, arg_b, arg_c, "", "embedded\nnewline", "edited after saving"]
+        args_editor.fill(json.dumps(final_args, ensure_ascii=False))
+        click(page, ".modal button", "批准并运行")
+        page.wait_for_timeout(2500)
+        # Re-open the editor: the argv must round-trip exactly.
+        click(page, "main .check .ghost", "修改检查配置")
+        page.wait_for_timeout(900)
+        args_now = page.evaluate(
+            "() => document.querySelector('.modal textarea[data-testid=args-editor]')?.value ?? ''"
+        )
+        expected = final_args
+        record("rc07-lossless-argv-roundtrip", bool(args_now) and json.loads(args_now) == expected, repr(args_now))
+        exe_now = page.evaluate(
+            "() => [...document.querySelectorAll('.modal input[type=text]')][1]?.value ?? ''"
+        )
+        record("rc07-exe-roundtrip", exe_now == exe_path, repr(exe_now))
+        # Restore the real check in the open editor.
+        page.evaluate(
+            """([v1, v2]) => {
+            const set = (el, v) => {
+              const proto = Object.getPrototypeOf(el);
+              Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+            };
+            const inputs = [...document.querySelectorAll('.modal input[type=text]')];
+            set(inputs[1], v1);
             set(document.querySelector('.modal textarea[data-testid=args-editor]'), v2);
         }""",
             [orig_exe, orig_args],
@@ -166,11 +168,40 @@ def main():
             set(document.querySelectorAll('.modal textarea')[1], 'C2: 取消行为尚未验证');
         }"""
         )
+        modal = page.locator(".modal")
+        next_action = modal.locator("textarea").first
+        withheld = []
+
+        def hold_export(route):
+            withheld.append((route, route.fetch()))
+
+        page.route("**/handoffs", hold_export)
+        with page.expect_request(lambda req: req.method == "POST" and req.url.endswith("/handoffs")):
+            modal.get_by_role("button", name="导出接手包", exact=True).click()
+        # A Playwright call pumps the route handler before the old response is released.
+        next_action.fill("暂改下一步")
+        next_action.fill("先复现 C2 取消等待。")
+        assert len(withheld) == 1, "expected one held export response"
+        route, response = withheld.pop()
+        assert response.ok, f"held export failed with HTTP {response.status}"
+        with page.expect_response(lambda received: received.url.endswith("/handoffs")):
+            route.fulfill(response=response)
+        page.unroute("**/handoffs", hold_export)
+        page.evaluate("() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))")
+        record("rc04-late-export-revoked", modal.locator("a[download]").count() == 0)
         click(page, ".modal button", "导出接手包")
         page.wait_for_timeout(2500)
         has_preview = page.evaluate("() => !!document.querySelector('[data-testid=handoff-preview]')")
         has_download = page.evaluate("() => !!document.querySelector('.modal a[download]')")
         record("rc04-preview-and-download-after-export", has_preview and has_download)
+        page.evaluate("""() => Object.defineProperty(navigator.clipboard, 'writeText', {
+            configurable: true,
+            value: text => new Promise(resolve => { window.copyText = text; window.finishCopy = resolve; })
+        })""")
+        modal.locator("button").filter(has_text="复制").first.click()
+        page.wait_for_function("() => typeof window.finishCopy === 'function'")
+        preview_text = modal.locator('[data-testid="handoff-preview"]').text_content()
+        record("rc04-clipboard-matches-preview", page.evaluate("window.copyText") == preview_text)
         # edit → revoke
         page.evaluate(
             """() => {
@@ -180,6 +211,7 @@ def main():
             el.dispatchEvent(new Event('input', { bubbles: true }));
         }"""
         )
+        page.evaluate("window.finishCopy()")
         page.wait_for_timeout(500)
         revoked = page.evaluate(
             """() => ({
@@ -190,6 +222,7 @@ def main():
         )
         record("rc04-edit-revokes-preview-and-download",
                not revoked["preview"] and not revoked["download"] and revoked["note"], str(revoked))
+        record("rc04-late-clipboard-feedback-revoked", modal.locator("button").filter(has_text="已复制").count() == 0)
         # A→B→A back to the exported text: still revoked (edit-event gate).
         page.evaluate(
             """() => {
@@ -255,7 +288,7 @@ def main():
 
         browser.close()
 
-    ok_all = all(a["ok"] for a in results["assertions"]) and not results["page_errors"]
+    ok_all = all(a["ok"] for a in results["assertions"]) and not results["page_errors"] and not results["external_requests"]
     results["ok"] = ok_all
     Path(out_path).write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
     print("GATE:", "PASS" if ok_all else "FAIL")

@@ -53,9 +53,16 @@ pub fn render_handoff_md(body: &HandoffBody, meta: &crate::model::HandoffMeta) -
     // 4. Verified (local results bound to snapshots)
     md.push_str("## Verified\n\n");
     if body.verified.is_empty() {
-        md.push_str("(no local verification recorded)\n\n");
+        md.push_str("(no local verification valid for the current candidate)\n\n");
     } else {
         for v in &body.verified {
+            md.push_str(&format!("- {}\n", v.replace('\n', " ")));
+        }
+        md.push('\n');
+    }
+    if !body.verified_historical.is_empty() {
+        md.push_str("### Historical (NOT valid for the current candidate)\n\n");
+        for v in &body.verified_historical {
             md.push_str(&format!("- {}\n", v.replace('\n', " ")));
         }
         md.push('\n');
@@ -139,6 +146,7 @@ mod tests {
             constraints: vec!["Do not push".into()],
             changed: vec!["src/retry.py +12 −4".into()],
             verified: vec!["unit-tests passed on sha256:abc (local)".into()],
+            verified_historical: vec![],
             open_items: vec![OpenItem { id: "C2".into(), text: "cancellation unverified".into() }],
             next_action: "Reproduce C2 first".into(),
             evidence: vec!["receipt.json".into()],

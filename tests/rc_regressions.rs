@@ -44,7 +44,7 @@ fn rc02_second_instance_rejected_and_first_db_untouched() {
 
     // A second launcher on the SAME data dir must fail fast with E_LIMIT.
     let exe = std::env::var("RC_TEST_EXE")
-        .unwrap_or_else(|_| "D:/dev/cache/relaycheck-target/debug/relaycheck.exe".to_string());
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_relaycheck").to_string());
     let out = std::process::Command::new(&exe)
         .args(["serve", "--data-dir", env.data_dir.to_string_lossy().as_ref()])
         .output()

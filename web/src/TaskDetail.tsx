@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, ApiError } from "./api";
 import { dict, Lang } from "./i18n";
 import { ErrorNote, Modal } from "./components";
@@ -27,7 +27,6 @@ export function TaskDetail({ taskId, t, lang, onBack, onChanged, detailTick }: D
   const lastSnapshot = useRef<string | null>(null);
   // RC05: only the latest fetch wins (late responses cannot clobber fresh state).
   const fetchGen = useRef(0);
-  const detailRef = useRef<any>(null);
 
   const load = useCallback(async () => {
     const gen = ++fetchGen.current;
@@ -35,7 +34,6 @@ export function TaskDetail({ taskId, t, lang, onBack, onChanged, detailTick }: D
       const r = await api.task(taskId);
       if (gen !== fetchGen.current) return; // a newer fetch superseded us
       setDetail(r.result);
-      detailRef.current = r.result;
       setError(null);
     } catch (e) {
       if (gen !== fetchGen.current) return;
@@ -425,7 +423,7 @@ export function TaskDetail({ taskId, t, lang, onBack, onChanged, detailTick }: D
         <CaptureModal t={t} taskId={task.id} revision={task.revision} onClose={() => setModal(null)} onDone={async () => { setModal(null); await load(); await onChanged(); }} />
       ) : null}
       {modal === "handoff" ? (
-        <HandoffModal t={t} lang={lang} taskId={task.id} revision={task.revision} onClose={() => setModal(null)} onChanged={onChanged} />
+        <HandoffModal t={t} lang={lang} taskId={task.id} revision={task.revision} candidate={`${active}:${task.candidate_epoch ?? 0}`} onClose={() => setModal(null)} onChanged={onChanged} />
       ) : null}
       {modal === "import" ? (
         <ImportModal t={t} taskId={task.id} revision={task.revision} onClose={() => setModal(null)} onDone={async (snapshotId: string | null) => {
@@ -439,12 +437,10 @@ export function TaskDetail({ taskId, t, lang, onBack, onChanged, detailTick }: D
         }} />
       ) : null}
       {modal === "profile" ? (
-        <ProfileModal t={t} lang={lang} taskId={task.id} revision={task.revision} profile={profile} onClose={() => setModal(null)} onSaved={async () => { await load(); await onChanged(); }} onApproved={async () => {
+        <ProfileModal t={t} lang={lang} taskId={task.id} revision={task.revision} profile={profile} onClose={() => setModal(null)} onSaved={async () => { await load(); await onChanged(); }} onApproved={async (approval) => {
           setModal(null);
-          const d = detailRef.current!;
-          const p = d.profile!.profile;
           await runOp("verify", () =>
-            api.verify(task.id, { profile_id: p.id, profile_hash: p.hash }, d.task.revision, crypto.randomUUID()),
+            api.verify(task.id, approval.identity, approval.revision, crypto.randomUUID()),
           );
         }} />
       ) : null}
@@ -711,14 +707,20 @@ function CaptureModal({
     </Modal>
   );
 }
-
+// RC04: one generation counter governs every async landing in the handoff
+// modal. ANY field edit, source-mode change, close/unmount, or a change of
+// the task identity bumps the generation; a held/resumed response, its
+// error path, its finally, a clipboard promise or a copied-timer may only
+// touch state when its generation still matches. Text equality never
+// revives a revoked share.
 function HandoffModal({
-  t, lang, taskId, revision, onClose, onChanged,
+  t, lang, taskId, revision, candidate, onClose, onChanged,
 }: {
   t: T;
   lang: Lang;
   taskId: string;
   revision: number;
+  candidate: string;
   onClose: () => void;
   onChanged: () => Promise<void>;
 }) {
@@ -732,14 +734,25 @@ function HandoffModal({
   const [busy, setBusy] = useState(false);
   const firstRef = useRef<HTMLTextAreaElement>(null);
 
-  // RC04: ANY field/source-mode change revokes the current preview, download
-  // and copy — the revoked state survives even if the user edits back
-  // (A→B→A), because the gate is the edit event, not text equality.
-  useEffect(() => {
+  const genRef = useRef(0);
+  const copyTimer = useRef<number | undefined>(undefined);
+  const invalidate = useCallback(() => {
+    genRef.current++;
+    window.clearTimeout(copyTimer.current);
     setPreview(null);
     setHandoffId(null);
     setCopied(false);
-  }, [nextAction, openItems, sourceMode]);
+    setBusy(false);
+    setErr(null);
+  }, []);
+
+  useLayoutEffect(() => {
+    invalidate();
+    return () => {
+      genRef.current++;
+      window.clearTimeout(copyTimer.current);
+    };
+  }, [taskId, revision, candidate, lang, invalidate]);
 
   const buildBody = () => ({
     source_mode: sourceMode,
@@ -757,32 +770,42 @@ function HandoffModal({
   });
 
   const exportNow = async () => {
-    setErr(null);
+    invalidate();
+    const gen = genRef.current;
     setBusy(true);
     try {
       const r = await api.createHandoff(taskId, buildBody(), crypto.randomUUID(), revision);
+      if (gen !== genRef.current) return; // edited/closed while in flight
       setPreview(r.result.handoff_md);
       setHandoffId(r.result.handoff_id);
       await onChanged();
     } catch (e) {
+      if (gen !== genRef.current) return; // stale failure must not surface
       setErr(e as ApiError);
     } finally {
-      setBusy(false);
+      if (gen === genRef.current) setBusy(false);
     }
   };
 
-  // RC04: copy is EXACTLY the previewed markdown (the immutable exported
-  // text), and clipboard failures surface as errors.
+  // RC04: copy is EXACTLY the previewed markdown; the clipboard promise is
+  // generation-checked so "Copied" cannot outlive a revocation.
   const copyNote = async () => {
     if (!preview) {
       setErr(new ApiError("E_STATE", t.copyNotAvailable, []));
       return;
     }
+    const gen = genRef.current;
+    const text = preview;
     try {
-      await navigator.clipboard.writeText(preview);
+      await navigator.clipboard.writeText(text);
+      if (gen !== genRef.current) return;
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => {
+        if (gen === genRef.current) setCopied(false);
+      }, 2000);
     } catch (e) {
+      if (gen !== genRef.current) return;
       setErr(new ApiError("E_INTERNAL", `${t.copyFailed}${String(e)}`, []));
     }
   };
@@ -794,15 +817,15 @@ function HandoffModal({
       <ErrorNote error={err?.message} details={err?.details} />
       <label className="field">
         <span>{t.nextActionLabel}</span>
-        <textarea ref={firstRef as any} value={nextAction} onChange={(e) => setNextAction(e.target.value)} placeholder={t.nextActionPlaceholder} />
+        <textarea ref={firstRef as any} value={nextAction} onChange={(e) => { invalidate(); setNextAction(e.target.value); }} placeholder={t.nextActionPlaceholder} />
       </label>
       <label className="field">
         <span>{t.openItemsLabel}</span>
-        <textarea value={openItems} onChange={(e) => setOpenItems(e.target.value)} />
+        <textarea value={openItems} onChange={(e) => { invalidate(); setOpenItems(e.target.value); }} />
       </label>
       <label className="field">
         <span>{t.sourceModeLabel}</span>
-        <select value={sourceMode} onChange={(e) => setSourceMode(e.target.value)}>
+        <select value={sourceMode} onChange={(e) => { invalidate(); setSourceMode(e.target.value); }}>
           <option value="context_only">{t.contextOnly}</option>
           <option value="portable_source">{t.portableSource}</option>
         </select>
@@ -903,12 +926,21 @@ function ImportModal({
   );
 }
 
-// RC07: lossless argv editing — one argument per line, no shell-ish
-// splitting; existing prep/outputs preserved through a validated JSON edit.
-function parseArgsLines(text: string): string[] {
-  const lines = text.split("\n").map((l) => l.replace(/\r$/, ""));
-  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  return lines;
+// RC07: the modal tracks ONE saved identity (the exact body the server
+// confirmed, plus the revision it was saved at). Any field edit resets it;
+// 批准并运行 saves if the form no longer matches the saved identity, so the
+// executed profile is always the one on screen, server-confirmed.
+type ProfileApproval = {
+  identity: { profile_id: string; profile_hash: string };
+  revision: number;
+};
+
+function parseArgs(text: string): string[] {
+  const value: unknown = JSON.parse(text);
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+    throw new Error("Arguments must be a JSON array of strings");
+  }
+  return value;
 }
 
 function ProfileModal({
@@ -921,12 +953,12 @@ function ProfileModal({
   profile: any | null;
   onClose: () => void;
   onSaved: () => Promise<void>;
-  onApproved: () => Promise<void>;
+  onApproved: (approval: ProfileApproval) => Promise<void>;
 }) {
   const first = profile?.checks?.[0] ?? null;
   const [name, setName] = useState(profile?.name ?? "local-checks");
   const [exe, setExe] = useState(first?.exe ?? "");
-  const [argsText, setArgsText] = useState<string>(first ? (first.args ?? []).join("\n") : "");
+  const [argsText, setArgsText] = useState<string>(JSON.stringify(first?.args ?? [], null, 2));
   const [required, setRequired] = useState(first?.required ?? true);
   const [timeoutSec, setTimeoutSec] = useState(String(first?.timeout_seconds ?? 600));
   const [outputsText, setOutputsText] = useState(JSON.stringify(profile?.outputs ?? []));
@@ -937,37 +969,54 @@ function ProfileModal({
   const [saved, setSaved] = useState(false);
   const firstRef = useRef<HTMLInputElement>(null);
 
-  // RC07: one save per revision — a second save in the same modal session
-  // would replay with a stale If-Match (the save bumped the revision), so
-  // 批准并运行 skips the redundant save when the version is already stored.
-  const savedRef = useRef(false);
-  const save = async (): Promise<any> => {
-    if (savedRef.current) return null;
-    // Validate JSON fields with real error messages before the request.
+  // The exact body that was last confirmed by the server (null = none).
+  const savedBodyRef = useRef<any>(null);
+  const approvalRef = useRef<ProfileApproval | null>(null);
+
+  const buildProfileBody = () => {
     JSON.parse(outputsText || "[]");
     JSON.parse(prepText || "[]");
-    const r = await api.saveProfile(
-      taskId,
-      {
-        name,
-        checks: [
-          {
-            id: first?.id ?? "check-1",
-            exe: exe.trim(),
-            args: parseArgsLines(argsText),
-            cwd_relative: first?.cwd_relative ?? "",
-            timeout_seconds: Number(timeoutSec) || 600,
-            required,
-          },
-          ...extraChecks,
-        ],
-        prep: JSON.parse(prepText || "[]"),
-        outputs: JSON.parse(outputsText || "[]"),
-      },
-      revision,
-    );
-    savedRef.current = true;
-    return r;
+    return {
+      name,
+      checks: [
+        {
+          id: first?.id ?? "check-1",
+          exe: exe.trim(),
+          args: parseArgs(argsText),
+          cwd_relative: first?.cwd_relative ?? "",
+          timeout_seconds: Number(timeoutSec) || 600,
+          required,
+        },
+        ...extraChecks,
+      ],
+      prep: JSON.parse(prepText || "[]"),
+      outputs: JSON.parse(outputsText || "[]"),
+    };
+  };
+
+  const formIsSaved = (): boolean => {
+    if (!saved || !savedBodyRef.current) return false;
+    try {
+      return (
+        JSON.stringify(buildProfileBody()) === JSON.stringify(savedBodyRef.current) &&
+        approvalRef.current?.revision === revision
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const doSave = async (): Promise<ProfileApproval> => {
+    const body = buildProfileBody(); // validates JSON with real errors first
+    const r = await api.saveProfile(taskId, body, revision);
+    savedBodyRef.current = body;
+    const approval = { identity: { profile_id: r.result.profile_id, profile_hash: r.result.hash }, revision: r.revision };
+    approvalRef.current = approval;
+    return approval;
+  };
+
+  const markEdited = () => {
+    setSaved(false);
   };
 
   return (
@@ -975,25 +1024,26 @@ function ProfileModal({
       <h2>{t.profileTitle}</h2>
       <p className="sub">{t.profileNote}</p>
       <ErrorNote error={err?.message} details={err?.details} />
+      <fieldset disabled={busy} style={{ padding: 0, margin: 0, border: 0, minWidth: 0 }}>
       <label className="field">
         <span>name</span>
-        <input type="text" value={name} onChange={(e) => setName(e.target.value)} />
+        <input type="text" value={name} onChange={(e) => { markEdited(); setName(e.target.value); }} />
       </label>
       <label className="field">
         <span>{t.exeLabel}</span>
-        <input ref={firstRef as any} type="text" value={exe} onChange={(e) => setExe(e.target.value)} />
+        <input ref={firstRef as any} type="text" value={exe} onChange={(e) => { markEdited(); setExe(e.target.value); }} />
       </label>
       <label className="field">
         <span>{t.argsLabel}</span>
-        <textarea data-testid="args-editor" value={argsText} onChange={(e) => setArgsText(e.target.value)} rows={3} />
+        <textarea data-testid="args-editor" value={argsText} onChange={(e) => { markEdited(); setArgsText(e.target.value); }} rows={3} />
       </label>
       <div className="inline-form">
         <label className="field" style={{ flex: 1 }}>
           <span>{t.timeoutLabel}</span>
-          <input type="text" value={timeoutSec} onChange={(e) => setTimeoutSec(e.target.value)} />
+          <input type="text" value={timeoutSec} onChange={(e) => { markEdited(); setTimeoutSec(e.target.value); }} />
         </label>
         <label className="checkline" style={{ alignSelf: "end" }}>
-          <input type="checkbox" checked={required} onChange={(e) => setRequired(e.target.checked)} />
+          <input type="checkbox" checked={required} onChange={(e) => { markEdited(); setRequired(e.target.checked); }} />
           <span>{t.requiredLabel}</span>
         </label>
       </div>
@@ -1001,14 +1051,15 @@ function ProfileModal({
         <>
           <label className="field">
             <span>{t.outputsLabel}</span>
-            <textarea value={outputsText} onChange={(e) => setOutputsText(e.target.value)} rows={2} />
+            <textarea value={outputsText} onChange={(e) => { markEdited(); setOutputsText(e.target.value); }} rows={2} />
           </label>
           <label className="field">
             <span>{t.prepLabel}</span>
-            <textarea value={prepText} onChange={(e) => setPrepText(e.target.value)} rows={2} />
+            <textarea value={prepText} onChange={(e) => { markEdited(); setPrepText(e.target.value); }} rows={2} />
           </label>
         </>
       ) : null}
+      </fieldset>
       <div className="actions">
         <button
           className="secondary"
@@ -1017,7 +1068,7 @@ function ProfileModal({
             setBusy(true);
             setErr(null);
             try {
-              await save();
+              await doSave();
               setSaved(true);
               await onSaved();
             } catch (e) {
@@ -1036,9 +1087,10 @@ function ProfileModal({
             setBusy(true);
             setErr(null);
             try {
-              await save();
-              await onSaved();
-              await onApproved();
+              const approval = formIsSaved() && approvalRef.current
+                ? approvalRef.current
+                : await doSave();
+              await onApproved(approval);
             } catch (e) {
               setErr(e as ApiError);
             } finally {
@@ -1050,11 +1102,17 @@ function ProfileModal({
         </button>
         <button className="secondary" onClick={onClose} disabled={busy}>{t.cancel}</button>
       </div>
-      {saved ? (
-        <p className="small-note" role="status">
+      {formIsSaved() ? (
+        <p className="small-note" role="status" data-testid="profile-saved-note">
           {lang === "zh"
             ? "已保存为新版本：旧许可与旧验证对新版本失效，运行前需重新批准。"
             : "Saved as a new version: old approvals and verifications do not apply; re-approve before running."}
+        </p>
+      ) : approvalRef.current !== null && !busy ? (
+        <p className="small-note" role="status" data-testid="profile-edited-note">
+          {lang === "zh"
+            ? "内容已修改：保存新版本后批准才会运行屏幕上显示的这一版。"
+            : "Edited: save a new version — approve then runs exactly the version shown."}
         </p>
       ) : null}
     </Modal>

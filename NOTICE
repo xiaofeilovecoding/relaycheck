@@ -1,15 +1,18 @@
 RelayCheck
 Copyright 2026 RelayCheck contributors
 
-This product is MIT-licensed (see the LICENSE placeholder in the release
-review notes; 0.1 is a review candidate and the final license text ships
-with the packaging round).
+RelayCheck is distributed under the MIT License. See LICENSE.
 
 Third-party runtime dependencies (Rust crates, see Cargo.lock for exact
 versions): tokio, axum, hyper, rusqlite (bundled SQLite — public domain),
 serde, serde_json, sha2, hex, uuid, zip, rand, regex, ureq, futures-util,
-include_dir, windows-sys. Frontend build-time dependencies (none ship to
-users): react, react-dom, vite, typescript.
+include_dir, windows-sys. The embedded frontend includes React, React DOM,
+and Scheduler. Vite and TypeScript are build tools.
+
+The include_dir 0.7.4 crate and its macros share the MIT license from their
+source commit d742c6fffce99ee89da91b934e7ce6fb2a82680c. See
+licenses/include_dir-0.7.4.txt. CI artifacts carry the collected dependency
+license texts alongside the executable.
 
 The bundled SQLite is maintained by the SQLite project
 (https://sqlite.org). This product is not affiliated with any coding-tool

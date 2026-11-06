@@ -8,6 +8,35 @@ use common::http::*;
 use common::*;
 
 #[test]
+fn busy_rejection_does_not_reserve_a_key() {
+    let env = TestEnv::new("busy-retry");
+    let http = start_http(&env);
+    let (_repo, task_id) = setup_capture_ready(&http, &env);
+    let path = format!("/v1/tasks/{task_id}/capture");
+    let body = serde_json::json!({"attest_stopped": true, "untracked_selected": [], "extra_excludes": []});
+    let rev = task_revision(&http, &task_id);
+    let initial: serde_json::Value = http.post_full(&path, body.clone(), Some("first"), Some(rev))
+        .unwrap().into_json().unwrap();
+    http.wait_op(initial["operation"]["id"].as_str().unwrap());
+
+    let _slot = env.ctx.ops.begin("occupied", "verify").unwrap();
+    let replay: serde_json::Value = http.post_full(&path, body.clone(), Some("first"), Some(rev))
+        .unwrap().into_json().unwrap();
+    assert_eq!(replay["operation"]["id"], initial["operation"]["id"]);
+    assert!(matches!(http.post_full(&path, body.clone(), Some("retry"), Some(rev)), Err(ureq::Error::Status(429, _))));
+    assert!(env.ctx.store.operation_by_key("retry").unwrap().is_none());
+    env.ctx.ops.finish("occupied");
+
+    let retry: serde_json::Value = http.post_full(&path, body, Some("retry"), Some(rev))
+        .unwrap().into_json().unwrap();
+    let id = retry["operation"]["id"].as_str().unwrap();
+    assert_ne!(id, initial["operation"]["id"].as_str().unwrap());
+    http.wait_op(id);
+    assert_eq!(env.ctx.store.operation_state(id).unwrap()["state"], "completed");
+    env.cleanup();
+}
+
+#[test]
 fn rc09_handoff_open_items_change_conflicts_not_replays() {
     let env = TestEnv::new("rc09");
     let http = start_http(&env);

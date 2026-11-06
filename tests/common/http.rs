@@ -41,7 +41,7 @@ pub fn start_http(env: &TestEnv) -> HttpTest {
             port,
             cli_token,
             events_tx: tx,
-            idem: std::sync::Mutex::new(std::collections::HashMap::new()),
+            admission: std::sync::Mutex::new(()),
         });
         let app = relaycheck::http::router(state);
         tokio::spawn(async move {

@@ -31,8 +31,8 @@ pub struct ServerState {
     pub port: u16,
     pub cli_token: String,
     pub events_tx: broadcast::Sender<i64>,
-    /// In-memory idempotent-request response cache (key → (digest, response json))
-    pub idem: std::sync::Mutex<HashMap<String, (String, serde_json::Value)>>,
+    /// Serializes replay lookup, slot acquisition, and operation admission.
+    pub admission: std::sync::Mutex<()>,
 }
 
 pub type S = State<Arc<ServerState>>;
@@ -178,38 +178,29 @@ fn digest_of(parts: &[&[u8]]) -> String {
     hex::encode(h.finalize())
 }
 
-/// RC09: idempotency lives in the operations table, not a memory cache, so
-/// replays survive restarts and the digest covers the full canonical request.
-/// Same key + same digest → replay the ORIGINAL operation (its current state
-/// incl. result); same key + different digest → conflict.
-enum IdemStart {
-    Fresh,
-    Replay(serde_json::Value),
-    Conflict,
-}
-
-fn idem_start(state: &ServerState, key: &str, digest: &str) -> RelayResult<IdemStart> {
-    if let Some(op) = state.ctx.store.operation_by_key(key)? {
-        let stored = state
-            .ctx
-            .store
-            .find_operation_by_idempotency(key)?
-            .map(|(_, _, _, d)| d)
-            .unwrap_or_default();
-        if stored == digest {
-            // Lift the stored result to the top level so replays have the
-            // same shape as the original response.
-            let result = op.get("result").cloned().unwrap_or(serde_json::Value::Null);
-            return Ok(IdemStart::Replay(json!({
-                "operation": op,
-                "result": result,
-                "replayed": true,
-            })));
-        }
-        return Ok(IdemStart::Conflict);
+/// Check a durable replay before admitting a new operation. The caller
+/// holds the admission lock until it has accepted or rejected the request.
+fn replay_operation(
+    state: &ServerState,
+    key: Option<&str>,
+    digest: &str,
+) -> RelayResult<Option<serde_json::Value>> {
+    let Some(key) = key else { return Ok(None) };
+    let Some((id, _, _, stored)) = state.ctx.store.find_operation_by_idempotency(key)? else {
+        return Ok(None);
+    };
+    if stored != digest {
+        return Err(RelayError::new(
+            Code::ERequestConflict,
+            "same Idempotency-Key used with a different request",
+        ));
     }
-    let _ = state;
-    Ok(IdemStart::Fresh)
+    let operation = state.ctx.store.operation_state(&id)?;
+    Ok(Some(json!({
+        "result": operation.get("result"),
+        "operation": operation,
+        "replayed": true,
+    })))
 }
 
 /// Wraps a synchronous result into the operation row keyed for idempotency.
@@ -224,15 +215,6 @@ fn sync_op_result(
         .update_operation(op_id, "completed", Some(&result.to_string()), None)
 }
 
-/// The replay envelope for an operation row (used by sync endpoints too).
-fn envelope_from_op(op: &serde_json::Value) -> serde_json::Value {
-    json!({"operation": op, "replayed": true})
-}
-
-// ---------------------------------------------------------------------------
-// Operation plumbing (async capture/verify on worker threads)
-// ---------------------------------------------------------------------------
-
 pub fn spawn_operation(
     state: &Arc<ServerState>,
     kind: &str,
@@ -242,11 +224,14 @@ pub fn spawn_operation(
     work: impl FnOnce(&Ctx, &str, crate::checks::CancelFlag) -> RelayResult<serde_json::Value> + Send + 'static,
 ) -> RelayResult<String> {
     let op_id = crate::ids::new_uuid();
-    state
-        .ctx
-        .store
-        .insert_operation(&op_id, kind, task_id, idem_key.as_deref(), request_digest)?;
+    // A busy rejection leaves no pending row, so the same key can retry.
     let cancel = state.ctx.ops.begin(&op_id, kind)?;
+    if let Err(error) = state.ctx.store.insert_operation(
+        &op_id, kind, task_id, idem_key.as_deref(), request_digest,
+    ) {
+        state.ctx.ops.finish(&op_id);
+        return Err(error);
+    }
     let st = state.clone();
     let op_id2 = op_id.clone();
     let kind2 = kind.to_string();
@@ -798,9 +783,18 @@ async fn capture_ep(
     let Ok(axum::Json(body)) = body else {
         return Err(RelayError::validation("invalid JSON"));
     };
-    if state.ctx.ops.any_active() {
-        return Err(RelayError::new(Code::ELimit, "another capture/check/import job is active"));
+    let digest = digest_of(&[
+        b"capture",
+        task_id.as_bytes(),
+        if_match.to_le_bytes().as_slice(),
+        serde_json::to_vec(&body).unwrap_or_default().as_slice(),
+    ]);
+    let idem = idempotency_key(&headers);
+    let _admission = state.admission.lock().unwrap();
+    if let Some(response) = replay_operation(&state, idem.as_deref(), &digest)? {
+        return Ok(ok_json(response));
     }
+
     // CAS: the capture activates a candidate only from the revision the
     // caller actually saw.
     let rev = state.ctx.store.task_int(&task_id, "revision")?;
@@ -810,34 +804,11 @@ async fn capture_ep(
             format!("If-Match revision {if_match} does not match current task revision {rev}"),
         ));
     }
-    let digest = digest_of(&[
-        b"capture",
-        task_id.as_bytes(),
-        serde_json::to_vec(&body).unwrap_or_default().as_slice(),
-    ]);
-    let idem = idempotency_key(&headers);
-    // RC09: replay FIRST (from the DB), then the busy check — a replayed
-    // request must succeed even while its original operation is queued.
-    if let Some(k) = &idem {
-        match idem_start(&state, k, &digest)? {
-            IdemStart::Replay(env) => return Ok(ok_json(env)),
-            IdemStart::Conflict => {
-                return Err(RelayError::new(
-                    Code::ERequestConflict,
-                    "same Idempotency-Key used with a different request body",
-                ))
-            }
-            IdemStart::Fresh => {}
-        }
-    }
-    let st = state.clone();
-    let t = task_id.clone();
     let st = state.clone();
     let t = task_id.clone();
     let attest = body.attest_stopped;
     let untracked = body.untracked_selected.clone();
     let excludes = body.extra_excludes.clone();
-    let idem_key = idem.clone();
     let op_id = spawn_operation(&state, "capture", Some(&task_id), idem, &digest, move |ctx, op_id, _cancel| {
         service::run_capture(ctx, &service::CaptureRequest {
             task_id: t,
@@ -910,32 +881,22 @@ async fn verify_ep(
         return Err(RelayError::validation("invalid JSON"));
     };
     let if_match = if_match_revision(&headers)?;
-    if state.ctx.ops.any_active() {
-        return Err(RelayError::new(Code::ELimit, "another capture/check/import job is active"));
-    }
     let digest = digest_of(&[
         b"verify",
         task_id.as_bytes(),
+        if_match.to_le_bytes().as_slice(),
         serde_json::to_vec(&body).unwrap_or_default().as_slice(),
     ]);
     let idem = idempotency_key(&headers);
-    if let Some(k) = &idem {
-        match idem_start(&state, k, &digest)? {
-            IdemStart::Replay(env) => return Ok(ok_json(env)),
-            IdemStart::Conflict => {
-                return Err(RelayError::new(
-                    Code::ERequestConflict,
-                    "same Idempotency-Key used with a different request body",
-                ))
-            }
-            IdemStart::Fresh => {}
-        }
+    let _admission = state.admission.lock().unwrap();
+    if let Some(response) = replay_operation(&state, idem.as_deref(), &digest)? {
+        return Ok(ok_json(response));
     }
+
     let t = task_id.clone();
     let trust = body.trust_confirmed;
     let pid = body.profile_id;
     let phash = body.profile_hash;
-    let idem_key = idem.clone();
     let op_id = spawn_operation(&state, "verify", Some(&task_id), idem, &digest, move |ctx, op_id, cancel| {
         let store = ctx.store.clone();
         let t_step = t.clone();
@@ -987,27 +948,13 @@ async fn create_handoff_ep(
     // RC09: digest covers the FULL canonical request, not a subset; the
     // operation row makes replays durable across restarts.
     let canon = canonical_request(&serde_json::to_value(&body).map_err(RelayError::from)?)?;
-    let digest = digest_of(&[b"handoff", task_id.as_bytes(), canon.as_slice()]);
+    let digest = digest_of(&[b"handoff", task_id.as_bytes(), &if_match.to_le_bytes(), canon.as_slice()]);
     let idem = idempotency_key(&headers);
-    if let Some(k) = &idem {
-        match idem_start(&state, k, &digest)? {
-            IdemStart::Replay(env) => return Ok(ok_json(env)),
-            IdemStart::Conflict => {
-                return Err(RelayError::new(
-                    Code::ERequestConflict,
-                    "same Idempotency-Key used with a different request body",
-                ))
-            }
-            IdemStart::Fresh => {}
-        }
+    let _admission = state.admission.lock().unwrap();
+    if let Some(response) = replay_operation(&state, idem.as_deref(), &digest)? {
+        return Ok(ok_json(response));
     }
-    if state.ctx.ops.any_active() {
-        return Err(RelayError::new(Code::ELimit, "another capture/check/import job is active"));
-    }
-    // Sync operation row: the replay envelope after completion carries the
-    // SAME handoff id and package hash as the original run.
-    let sync_op = crate::ids::new_uuid();
-    state.ctx.store.insert_operation(&sync_op, "handoff", Some(&task_id), idem.as_deref(), &digest)?;
+
     // CAS for handoff export: the package binds the revision it was made from.
     let rev = state.ctx.store.task_int(&task_id, "revision")?;
     if rev != if_match {
@@ -1015,6 +962,12 @@ async fn create_handoff_ep(
             Code::ERevisionConflict,
             format!("If-Match revision {if_match} does not match current task revision {rev}"),
         ));
+    }
+    let sync_op = crate::ids::new_uuid();
+    let _cancel = state.ctx.ops.begin(&sync_op, "handoff")?;
+    if let Err(error) = state.ctx.store.insert_operation(&sync_op, "handoff", Some(&task_id), idem.as_deref(), &digest) {
+        state.ctx.ops.finish(&sync_op);
+        return Err(error);
     }
     let created = service::create_handoff(&state.ctx, &service::HandoffRequest {
         task_id: task_id.clone(),
@@ -1024,6 +977,7 @@ async fn create_handoff_ep(
         notes_constraints: body.notes_constraints,
         edited_fields: body.edited_fields,
     });
+    state.ctx.ops.finish(&sync_op);
     let (handoff_id, package_sha, md) = match created {
         Ok(v) => v,
         Err(e) => {

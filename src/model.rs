@@ -172,8 +172,13 @@ pub struct HandoffBody {
     pub constraints: Vec<String>,
     /// What changed relative to the parent baseline (machine-filled facts)
     pub changed: Vec<String>,
-    /// local_verified_summary: which checks passed on which snapshot
+    /// local_verified_summary: which checks passed on which snapshot —
+    /// ONLY rounds valid for the complete current identity (RC10).
     pub verified: Vec<String>,
+    /// Past passing rounds explicitly marked NOT valid for the current
+    /// candidate (history is kept, never silently dropped).
+    #[serde(default)]
+    pub verified_historical: Vec<String>,
     pub open_items: Vec<OpenItem>,
     pub next_action: String,
     /// Evidence index lines (receipt.json, manifest.json, ...)

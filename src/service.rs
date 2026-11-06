@@ -38,13 +38,6 @@ pub fn find_python_exe() -> Option<std::path::PathBuf> {
             }
         }
     }
-    let candidates = ["D:/dev/python/python.exe", "C:/Python314/python.exe", "C:/Python312/python.exe"];
-    for c in candidates {
-        let p = std::path::PathBuf::from(c);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
     None
 }
 
@@ -196,7 +189,6 @@ pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
     // never presented as retry verification.
     if let Some(python) = find_python_exe() {
         let demo_rev = ctx.store.task_int(&task_id, "revision")?;
-        let test_script = repo_dir.join("tests").join("test_retry.py");
         let profile = save_profile(
             ctx,
             &task_id,
@@ -207,7 +199,10 @@ pub fn create_demo(ctx: &Ctx) -> RelayResult<String> {
                 // -B: no bytecode cache writes — the check stays read-only
                 // on the snapshot copy (a real run invalidated once through
                 // __pycache__; see the RC08 gate evidence).
-                args: vec!["-B".into(), test_script.to_string_lossy().into_owned()],
+                // RC08: the test entry is RELATIVE — it resolves inside the
+                // captured snapshot copy, never the original repo, so the
+                // verified bytes are exactly the handed-off ones.
+                args: vec!["-B".into(), "tests/test_retry.py".into()],
                 cwd_relative: String::new(),
                 timeout_seconds: 60,
                 required: true,
@@ -709,23 +704,55 @@ pub fn create_handoff(ctx: &Ctx, req: &HandoffRequest) -> RelayResult<(String, S
     let mut constraints: Vec<String> = serde_json::from_str(&constraints_json)?;
     constraints.extend(req.notes_constraints.iter().cloned());
 
-    // local_verified_summary: valid local verifications for THIS snapshot.
-    let verified = ctx
-        .store
-        .verifications_for_task(&req.task_id)?
-        .into_iter()
-        .filter(|v| v.snapshot_id == active && v.round_status == "passed")
-        .map(|v| {
-            let ids: Vec<String> = v.results.iter().filter(|r| r.status == "passed").map(|r| r.check_id.clone()).collect();
-            format!(
+    // RC10: the CURRENT verified projection only includes local rounds that
+    // are valid for the COMPLETE current identity (revision + snapshot +
+    // profile hash + environment + candidate epoch) — exactly the validity
+    // the acceptance CAS uses, via latest_valid_verification. Everything
+    // else is history and is listed explicitly as NOT valid for the
+    // current candidate.
+    let mut verified: Vec<String> = Vec::new();
+    let mut verified_historical: Vec<String> = Vec::new();
+    let current_round = ctx.store.latest_valid_verification(&req.task_id, &active)?;
+    if let Some(v) = &current_round {
+        if v.round_status == "passed" {
+            let ids: Vec<String> = v
+                .results
+                .iter()
+                .filter(|r| r.status == "passed")
+                .map(|r| r.check_id.clone())
+                .collect();
+            verified.push(format!(
                 "{} on {} (local, revision {}, epoch {})",
                 ids.join(", "),
                 crate::ids::short_hash(&active),
                 v.task_revision,
                 v.environment_epoch
-            )
-        })
-        .collect();
+            ));
+        }
+    }
+    for v in ctx.store.verifications_for_task(&req.task_id)? {
+        if let Some(cur) = &current_round {
+            if v.id == cur.id {
+                continue;
+            }
+        }
+        if v.round_status != "passed" {
+            continue;
+        }
+        let ids: Vec<String> = v
+            .results
+            .iter()
+            .filter(|r| r.status == "passed")
+            .map(|r| r.check_id.clone())
+            .collect();
+        verified_historical.push(format!(
+            "{} on {} (revision {}, epoch {}) — NOT valid for the current candidate",
+            ids.join(", "),
+            crate::ids::short_hash(&v.snapshot_id),
+            v.task_revision,
+            v.environment_epoch
+        ));
+    }
 
     let changed: Vec<String> = Vec::new(); // filled for returns via diff page; A-side export has no parent yet
 
@@ -734,6 +761,7 @@ pub fn create_handoff(ctx: &Ctx, req: &HandoffRequest) -> RelayResult<(String, S
         constraints: constraints.clone(),
         changed,
         verified,
+        verified_historical,
         open_items: req.open_items.clone(),
         next_action: req.next_action.trim().to_string(),
         evidence: vec![
@@ -758,16 +786,17 @@ pub fn create_handoff(ctx: &Ctx, req: &HandoffRequest) -> RelayResult<(String, S
     };
     let md = handoff::render_handoff_md(&body, &meta)?;
 
-    let claims: Vec<Claim> = ctx
-        .store
-        .verifications_for_task(&req.task_id)?
-        .into_iter()
-        .filter(|v| v.snapshot_id == active)
-        .flat_map(|v| {
-            let ids: Vec<String> = v.results.iter().filter(|r| r.status == "passed").map(|r| r.check_id.clone()).collect();
-            ids.into_iter().map(|cid| zipx::claim(&cid, "passed", &active))
-        })
-        .collect();
+    // RC10: receipt claims are OPAQUE passed marks; only the round that is
+    // valid for the complete current identity may produce them.
+    let claims: Vec<Claim> = match &current_round {
+        Some(v) if v.round_status == "passed" => v
+            .results
+            .iter()
+            .filter(|r| r.status == "passed")
+            .map(|r| zipx::claim(&r.check_id, "passed", &active))
+            .collect(),
+        _ => Vec::new(),
+    };
 
     let receipt = Receipt {
         schema_version: RECEIPT_SCHEMA_VERSION,

@@ -2,10 +2,9 @@
 
 ## Reporting
 
-RelayCheck 0.1 is a local review candidate without a public issue tracker
-yet. Report suspected vulnerabilities privately to the maintainer (see the
-repository host once published); do not open public issues for
-vulnerability reports. There is no paid bounty program.
+Report suspected vulnerabilities through GitHub private vulnerability reporting.
+Include the affected version, minimal reproduction, and impact. Use synthetic
+data in reproductions. [Report a vulnerability](https://github.com/xiaofeilovecoding/relaycheck/security/advisories/new)
 
 ## Scope
 

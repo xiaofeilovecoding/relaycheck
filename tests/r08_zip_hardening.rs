@@ -270,22 +270,23 @@ fn r08_reparse_point_in_repo_rejected_on_capture() {
     let env = TestEnv::new("r08h");
     let repo = env.make_git_repo("reparse");
     repo.write("a.txt", b"x\n");
-    // A junction pointing outside the repo.
-    let outside = env.scratch.join("outside");
-    std::fs::create_dir_all(&outside).unwrap();
-    let junction = repo.root.join("junction");
-    mklink_junction(&junction, &outside);
-    if !junction.exists() {
-        eprintln!("junction creation unavailable; reparse capture path not exercisable");
-        return;
-    }
+    repo.write("junction/tracked.txt", b"tracked\n");
     repo.git(&["add", "."]);
     repo.git(&["commit", "-qm", "c"]);
+    // Replace a directory Git actually tracks with a link outside the repo.
+    let junction = repo.root.join("junction");
+    std::fs::rename(&junction, env.scratch.join("original-directory")).unwrap();
+    let outside = env.scratch.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let canary = outside.join("tracked.txt");
+    std::fs::write(&canary, b"outside canary\n").unwrap();
+    mklink_junction(&junction, &outside);
+    assert!(junction.join("tracked.txt").exists(), "test requires a working link");
     let (_p, task_id) = setup_project_task(&env, &repo, "reparse");
     let err = capture_all(&env, &task_id).unwrap_err();
     assert_eq!(err.code, relaycheck::errors::Code::EPathBoundary, "err: {err:?}");
     // The outside canary is untouched by capture attempts.
-    assert!(outside.exists());
+    assert_eq!(std::fs::read(canary).unwrap(), b"outside canary\n");
     env.cleanup();
 }
 
@@ -352,6 +353,9 @@ fn count_snapshots(env: &TestEnv) -> usize {
 }
 
 fn mklink_junction(link: &std::path::Path, target: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("create test symlink");
+    #[cfg(windows)]
     let _ = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
         .arg(link)

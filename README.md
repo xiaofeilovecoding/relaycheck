@@ -1,5 +1,7 @@
 # RelayCheck
 
+[![CI](https://github.com/xiaofeilovecoding/relaycheck/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaofeilovecoding/relaycheck/actions/workflows/ci.yml) · [简体中文](README.zh-CN.md)
+
 **Switch tools. Keep the task and checks in sync.**
 
 RelayCheck is a small local workspace for handing coding tasks between
@@ -21,8 +23,8 @@ tools — with file versions, checks, and the next step kept together.
 RelayCheck runs one local service on your machine: register a Git project,
 capture a candidate snapshot, run checks you explicitly approve, export an
 open handoff package, and bring the returned work back as a new candidate
-with a real change list. Nothing is sent to any coding tool automatically
-and nothing leaves this computer.
+with a real change list. The service stores its data locally. Approved
+check commands run under your account and can access resources your account can access.
 
 It is **not** an agent scheduler, not a model proxy, and not a code-quality
 guarantee. It does not apply, merge or push anything by itself, and it does
@@ -30,14 +32,15 @@ not authenticate who sent a package — hashes bind content, not senders.
 
 | | |
 |---|---|
-| Platforms | Windows 10 x64 (verified here); Windows/Linux CI untested — see the delivery notes for the honest status |
+| Platforms | Windows 10 x64 verified locally. GitHub Actions runs Windows and Linux checks. |
 | Install | none — one executable, your existing Git and Python |
 | Network | localhost only; no account, no API key |
 | Data | SQLite + content-addressed blobs under your data directory |
 
 ## Quick start
 
-Requirements: Windows 10+, [Git](https://git-scm.com) on PATH. Python (or
+Use the executable from a successful [CI run](https://github.com/xiaofeilovecoding/relaycheck/actions/workflows/ci.yml), or build from source below.
+Requirements: [Git](https://git-scm.com) on PATH. Python (or
 anything you approve as a check command) only if you want to run checks.
 
 ```text
@@ -121,17 +124,17 @@ checks, and ships a self-only CSP. See
 ## Development
 
 ```text
-cargo test            # unit + integration gates (R01–R14 suites)
-cd web && npm install && npm run build   # rebuilds the embedded UI
-cargo build --release
+npm --prefix web ci
+npm --prefix web run build
+cargo test --locked
+cargo build --release --locked
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the gate map (R01–R21) and the
-screenshot capture script. This is the 0.1 review candidate — expect rough
-edges; see the delivery report for what is not yet verified.
+The frontend build must precede Cargo so the executable can embed the assets.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the browser gate and contribution workflow.
 
 ![Mobile 390, English](docs/img/mobile-390-en.png)
 
 ## License
 
-MIT — see [NOTICE](NOTICE).
+[MIT](LICENSE) · [Third-party notices](NOTICE)

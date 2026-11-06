@@ -1,7 +1,7 @@
 # Contributing
 
-RelayCheck 0.1 is a review candidate. This document maps the acceptance
-gates to code and tests so a reviewer can reproduce everything locally.
+GitHub Issues and pull requests are welcome. Describe a concrete workflow or
+include a minimal reproduction. A maintainer reviews changes after CI.
 
 ## Layout
 
@@ -10,8 +10,8 @@ src/            Rust service + CLI (single binary; the web UI is embedded)
 web/            React/TypeScript frontend (built into the binary)
 tests/          Integration gate suites (real git repos, real check processes)
 schemas/        JSON Schema for receipt.json / manifest.json
-docs/           api.md, screenshots (generated locally, not committed)
-scripts/        capture_screenshots.py, verify_runtime.py, relay_experiment.py
+docs/           API contract and public screenshots made with synthetic data
+scripts/        Browser gates and local verification utilities
 ```
 
 ## Gate map (spec RELAYCHECK-SPEC.md §9)
@@ -43,14 +43,18 @@ scripts/        capture_screenshots.py, verify_runtime.py, relay_experiment.py
 ## Commands
 
 ```text
-cargo test                                   # all gates (needs python.exe + git on PATH)
-cd web && npm install && npm run build       # rebuild embedded UI, then cargo build
-cargo build --release                        # single-file production candidate
+npm --prefix web ci
+npm --prefix web run build
+cargo test --locked
+cargo build --release --locked
+python -m pip install playwright==1.64.1
+python -m playwright install chromium
+python scripts/run_ui_gates.py target/release/relaycheck target/ui-gates.json
 ```
 
-Set `RELAYCHECK_TEST_ROOT` to redirect the integration test scratch area
-(default `D:/dev/relaycheck-test-data` on the authoring machine; any temp
-dir works).
+On Windows use `target/release/relaycheck.exe` for the browser gate. Git and
+Python 3 must be on PATH. Set `RELAYCHECK_TEST_ROOT` to redirect test scratch
+files from the system temporary directory.
 
 ## Rules this project holds itself to
 
@@ -58,5 +62,5 @@ dir works).
   standing in for conditions.
 - A fix lands together with the regression that failed first.
 - Screenshots are real production captures — never mock-ups.
-- Product data, reports and screenshots stay out of the product git history.
+- Product data and internal reports stay local. Public screenshots use synthetic data.
 - Honesty over gloss: unverified things are recorded as unverified.

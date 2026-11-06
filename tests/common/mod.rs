@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn test_root() -> PathBuf {
     std::env::var("RELAYCHECK_TEST_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("D:/dev/relaycheck-test-data"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("relaycheck-tests"))
 }
 
 pub fn unique_tag(tag: &str) -> String {
@@ -136,18 +136,7 @@ impl Repo {
 }
 
 pub fn git_exe() -> PathBuf {
-    let candidates = [
-        "D:/dev/Git/cmd/git.exe",
-        "C:/Program Files/Git/cmd/git.exe",
-        "C:/Program Files/Git/bin/git.exe",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return p;
-        }
-    }
-    PathBuf::from("git")
+    relaycheck::service::git_exe_path().expect("Git is required for integration tests")
 }
 
 pub fn null_device() -> &'static str {
@@ -158,29 +147,9 @@ pub fn null_device() -> &'static str {
     }
 }
 
-/// Locates a real python.exe for check-profile processes. Skips the test
-/// (not a silent pass) when no python is available.
+/// Locates the same interpreter as the production demo.
 pub fn find_python() -> PathBuf {
-    let candidates = [
-        "D:/dev/python/python.exe",
-        "C:/Python314/python.exe",
-        "C:/Python312/python.exe",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let full = dir.join("python.exe");
-            if full.is_file() {
-                return full;
-            }
-        }
-    }
-    panic!("no python.exe found for check-profile tests");
+    relaycheck::service::find_python_exe().expect("Python 3 is required for integration tests")
 }
 
 /// Attaches a repo and creates a task, returning (project_id, task_id).
@@ -331,7 +300,7 @@ pub fn server_state(
         port: 0,
         cli_token: "test-cli-token-0123456789abcdef".into(),
         events_tx: tx,
-        idem: std::sync::Mutex::new(std::collections::HashMap::new()),
+        admission: std::sync::Mutex::new(()),
     })
 }
 
