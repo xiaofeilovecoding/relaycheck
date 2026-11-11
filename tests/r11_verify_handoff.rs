@@ -611,3 +611,83 @@ fn r11_declared_base_head_must_be_commit_shaped() {
     assert_eq!(out.base_head_match, None);
     let _ = fx.env.cleanup();
 }
+
+#[test]
+fn r04_relative_package_input_same_result_as_absolute() {
+    // the README advertises plain relative ZIP paths: the CLI must give the
+    // SAME result for the same package addressed relatively and absolutely
+    let fx = build_fixture("r04rel");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_relaycheck"));
+    let repo_arg = fx.repo.root.clone();
+    let pkg_abs = fx.env.scratch.join("rel-pkg.zip");
+    std::fs::write(&pkg_abs, &fx.context_pkg).unwrap();
+    // drift so both runs exit 1 (a real comparison, not just success)
+    fx.repo.write("docs/plan.md", b"step one\nstep TWO\n".as_slice());
+    // absolute
+    let abs = std::process::Command::new(&exe)
+        .args(["verify-handoff", pkg_abs.to_str().unwrap(), "--repo", repo_arg.to_str().unwrap()])
+        .output()
+        .expect("spawn");
+    assert_eq!(abs.status.code(), Some(1), "absolute input drifts: {}", String::from_utf8_lossy(&abs.stdout));
+    // relative: run FROM the scratch directory with a bare file name
+    let rel = std::process::Command::new(&exe)
+        .args(["verify-handoff", "rel-pkg.zip", "--repo", repo_arg.to_str().unwrap()])
+        .current_dir(fx.env.scratch.clone())
+        .output()
+        .expect("spawn");
+    assert_eq!(rel.status.code(), Some(1), "relative input drifts: {}", String::from_utf8_lossy(&rel.stdout));
+    assert_eq!(abs.stdout, rel.stdout, "absolute and relative produce identical output");
+    let _ = fx.env.cleanup();
+}
+
+#[test]
+fn r04_unverifiable_handle_identity_blocks_deterministically() {
+    // a package reached THROUGH a junction cannot have its handle identity
+    // proven against the junction path: the run blocks instead of reading
+    let fx = build_fixture("r04jct");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_relaycheck"));
+    let repo_arg = fx.repo.root.clone();
+    let real_dir = fx.env.scratch.join("real-pkgs");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    let pkg = real_dir.join("pkg.zip");
+    std::fs::write(&pkg, &fx.context_pkg).unwrap();
+    let link_dir = fx.env.scratch.join("linked-pkgs");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink");
+    #[cfg(windows)]
+    {
+        let ok = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link_dir)
+            .arg(&real_dir)
+            .output()
+            .expect("mklink spawn")
+            .status
+            .success();
+        if !ok {
+            // without junction privileges the deterministic case is covered
+            // by the symlink path on other platforms
+            let _ = fx.env.cleanup();
+            return;
+        }
+    }
+    let through_link = link_dir.join("pkg.zip");
+    let scratch_for_echo = fx.env.scratch.clone();
+    let out = std::process::Command::new(&exe)
+        .args(["verify-handoff", through_link.to_str().unwrap(), "--repo", repo_arg.to_str().unwrap(), "--json"])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(3), "junction-addressed package blocks: {}", String::from_utf8_lossy(&out.stdout));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(scratch_for_echo.to_str().unwrap()),
+        "no absolute path echoed: {stdout}"
+    );
+    // the same package addressed directly still verifies as a match
+    let direct = std::process::Command::new(&exe)
+        .args(["verify-handoff", pkg.to_str().unwrap(), "--repo", repo_arg.to_str().unwrap(), "--json"])
+        .output()
+        .expect("spawn");
+    assert_eq!(direct.status.code(), Some(0), "direct package still matches");
+    let _ = fx.env.cleanup();
+}

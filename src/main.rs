@@ -521,19 +521,27 @@ enum PackageReadError {
 /// Opens the package with write sharing denied, proves the HANDLE resolves to
 /// the named path, and reads the bounded bytes from that same handle with a
 /// size-stability check. A same-size concurrent write makes the read uncertain
-/// (blocked), never trusted.
+/// (blocked), never trusted. Relative inputs are resolved against the explicit
+/// current working directory first so the identity check is absolute-vs-absolute.
 fn open_package_handle(pkg_path: &Path, max_package: u64) -> Result<Vec<u8>, PackageReadError> {
     use std::io::Read;
+    let resolved_pkg: PathBuf = if pkg_path.is_absolute() {
+        pkg_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| PackageReadError::Uncertain)?
+            .join(pkg_path)
+    };
     #[cfg(windows)]
     let f = {
         use std::os::windows::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
             .read(true)
             .share_mode(1) // FILE_SHARE_READ only: deny write/delete sharing
-            .open(pkg_path)
+            .open(&resolved_pkg)
     };
     #[cfg(not(windows))]
-    let f = std::fs::File::open(pkg_path);
+    let f = std::fs::File::open(&resolved_pkg);
     let mut f = match f {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -547,7 +555,7 @@ fn open_package_handle(pkg_path: &Path, max_package: u64) -> Result<Vec<u8>, Pac
     match relaycheck::verify_handoff::handle_final_path_public(&f) {
         Some(resolved) => {
             let a = relaycheck::verify_handoff::normalize_path_public(Path::new(&resolved));
-            let b = relaycheck::verify_handoff::normalize_path_public(pkg_path);
+            let b = relaycheck::verify_handoff::normalize_path_public(&resolved_pkg);
             if a != b {
                 return Err(PackageReadError::Uncertain);
             }

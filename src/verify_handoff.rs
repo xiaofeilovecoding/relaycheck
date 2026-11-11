@@ -226,8 +226,13 @@ fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
             }
         }
         None => {
-            // non-Windows: vouch by handle metadata identity (dev/ino) against
-            // the path metadata taken at the same instant
+            // R04: fail closed — when the handle's own identity cannot be
+            // obtained on this platform the read NEVER proceeds; only the
+            // non-Windows dev/ino fallback may vouch for the handle.
+            #[cfg(windows)]
+            {
+                return ReadOutcome::Refused("read handle identity cannot be resolved");
+            }
             #[cfg(not(windows))]
             {
                 use std::os::unix::fs::MetadataExt;
