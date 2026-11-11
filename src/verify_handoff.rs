@@ -119,9 +119,10 @@ fn normalize_manifest_path(raw: &str) -> RelayResult<String> {
 
 /// Reads one listed file from the checkout with the confirmed-safe primitives:
 /// lexical boundary check, per-level reparse-point refusal down the whole
-/// ancestor chain, one opened handle whose resolution is proven to stay on
-/// the expected path, a bounded read through that handle, and a size
-/// stability check so an input that mutates mid-read can never pass.
+/// ancestor chain, one handle opened with write-sharing DENIED, that handle's
+/// own final-path identity proven against the expected location, a bounded
+/// read through that same handle, and a pre/post metadata stability check so
+/// a concurrent same-size write is blocked rather than trusted.
 enum ReadOutcome {
     Bytes(Vec<u8>),
     Missing,
@@ -137,6 +138,45 @@ fn normalize_for_identity(p: &Path) -> String {
     let s = p.to_string_lossy().replace('/', "\\");
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_lowercase();
     s.trim_end_matches('\\').to_string()
+}
+
+/// The final path of the ACTUAL opened handle (R03: the handle participates
+/// in the identity check — a path re-resolution cannot vouch for what was
+/// really opened). None when the platform call fails.
+#[cfg(windows)]
+fn handle_final_path(f: &std::fs::File) -> Option<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED,
+    };
+    let mut buf = [0u16; 1024];
+    let n = unsafe {
+        GetFinalPathNameByHandleW(f.as_raw_handle() as _, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED)
+    };
+    if n == 0 || (n as usize) > buf.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..n as usize]))
+}
+
+#[cfg(not(windows))]
+fn handle_final_path(_f: &std::fs::File) -> Option<String> {
+    None
+}
+
+/// Opens a listed file with write sharing denied: while this handle lives,
+/// another writer cannot open the file for writing, so the bounded read is
+/// stable by construction; a file already open for writing fails to open.
+#[cfg(windows)]
+fn open_read_handle(joined: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ only: deny write and delete sharing for the read.
+    std::fs::OpenOptions::new().read(true).share_mode(1).open(joined)
+}
+
+#[cfg(not(windows))]
+fn open_read_handle(joined: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(joined)
 }
 
 fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
@@ -166,21 +206,44 @@ fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
             _ => break,
         }
     }
-    // Open ONE handle and prove it resolves to the expected path: a handle
-    // opened through a link/alias resolves elsewhere, which canonicalize
-    // exposes. Anything uncertain is refused, never read through.
-    let f = match std::fs::File::open(&joined) {
+    // Open ONE handle (write-sharing denied) and prove THE HANDLE's own
+    // identity: the final path resolved from the handle must be the expected
+    // location. A path-level re-resolution cannot vouch for what was really
+    // opened; anything uncertain is refused, never read through.
+    let f = match open_read_handle(&joined) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
-        Err(_) => return ReadOutcome::Unreadable,
+        Err(_) => {
+            // already open for writing elsewhere, or denied: an uncertain
+            // read is blocked, never trusted
+            return ReadOutcome::Refused("file cannot be opened with exclusive read sharing");
+        }
     };
-    match std::fs::canonicalize(&joined) {
-        Ok(resolved) => {
-            if normalize_for_identity(&resolved) != normalize_for_identity(&joined) {
+    match handle_final_path(&f) {
+        Some(resolved) => {
+            if normalize_for_identity(Path::new(&resolved)) != normalize_for_identity(&joined) {
                 return ReadOutcome::Refused("read handle resolves off the expected path");
             }
         }
-        Err(_) => return ReadOutcome::Refused("read handle cannot be resolved"),
+        None => {
+            // non-Windows: vouch by handle metadata identity (dev/ino) against
+            // the path metadata taken at the same instant
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let handle_md = match f.metadata() {
+                    Ok(m) => m,
+                    Err(_) => return ReadOutcome::Unreadable,
+                };
+                let path_md = match std::fs::metadata(&joined) {
+                    Ok(m) => m,
+                    Err(_) => return ReadOutcome::Unreadable,
+                };
+                if handle_md.dev() != path_md.dev() || handle_md.ino() != path_md.ino() {
+                    return ReadOutcome::Refused("read handle resolves off the expected path");
+                }
+            }
+        }
     }
     let md = match f.metadata() {
         Ok(m) => m,
@@ -190,6 +253,7 @@ fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
         return ReadOutcome::Refused("target is not a regular file");
     }
     let before_len = md.len();
+    let before_modified = md.modified().ok();
     let mut buf = Vec::new();
     let mut handle = f;
     let taken = match handle
@@ -203,14 +267,39 @@ fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
     if taken as i64 > MAX_PACKAGE_FILE_BYTES {
         return ReadOutcome::Refused("file exceeds the per-file read limit");
     }
-    // Stability: the same handle must still report the size it opened with;
-    // a mid-read mutation makes the read uncertain and blocks the run.
+    // Stability: the same handle must still report the size and modification
+    // time it opened with — a same-size concurrent write is detected (mtime)
+    // and blocked, never trusted as a match.
     match handle.metadata() {
-        Ok(after) if after.len() == before_len => {}
-        Ok(_) => return ReadOutcome::Refused("file changed while being read"),
+        Ok(after) => {
+            if after.len() != before_len {
+                return ReadOutcome::Refused("file changed while being read");
+            }
+            if let (Some(before), Ok(after_t)) = (before_modified, after.modified()) {
+                if before != after_t {
+                    return ReadOutcome::Refused("file changed while being read");
+                }
+            }
+        }
         Err(_) => return ReadOutcome::Refused("file stability cannot be confirmed"),
     }
     ReadOutcome::Bytes(buf)
+}
+
+/// Public wrappers so the CLI can apply the same handle-identity rules to
+/// the ZIP input it reads. Controlled outputs only: normalized path text.
+pub fn normalize_path_public(p: &Path) -> String {
+    normalize_for_identity(p)
+}
+
+#[cfg(windows)]
+pub fn handle_final_path_public(f: &std::fs::File) -> Option<String> {
+    handle_final_path(f)
+}
+
+#[cfg(not(windows))]
+pub fn handle_final_path_public(_f: &std::fs::File) -> Option<String> {
+    None
 }
 
 fn observe_head(repo_root: &str, isolated_home: &Path) -> Option<String> {
@@ -278,9 +367,16 @@ pub fn verify(
         return Err(blocked("checkout root is a link or reparse point; refusing to verify"));
     }
 
-    // Base HEAD is reported independently of the content comparison.
-    let observed = observe_head(repo_root, isolated_home);
+    // Base HEAD is reported independently of the content comparison. A
+    // declared value must at least be a commit-shaped identifier; anything
+    // else makes the receipt unverifiable.
     let declared = receipt.base_head.trim().to_lowercase();
+    if !declared.is_empty()
+        && (declared.len() != 40 || !declared.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(blocked("declared base_head is not a commit id"));
+    }
+    let observed = observe_head(repo_root, isolated_home);
     let base_head_match = match (declared.is_empty(), &observed) {
         (true, _) => None,
         (_, None) => None,
@@ -467,6 +563,30 @@ mod tests {
         ] {
             assert!(normalize_manifest_path(bad).is_err(), "must refuse: {bad}");
         }
+    }
+
+    #[test]
+    fn handle_final_path_vouches_the_opened_file() {
+        // deterministic positive: the handle of a really-opened file resolves
+        // to the same normalized identity as its path
+        let dir = std::env::temp_dir().join(format!("r11-handle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("target.txt");
+        std::fs::write(&p, b"content").unwrap();
+        let f = open_read_handle(&p).expect("open");
+        let resolved = handle_final_path(&f).expect("final path available");
+        assert_eq!(
+            normalize_for_identity(Path::new(&resolved)),
+            normalize_for_identity(&p),
+            "the handle identity matches the opened path"
+        );
+        // a different location must not compare equal (the refusal branch)
+        assert_ne!(
+            normalize_for_identity(Path::new(&resolved)),
+            normalize_for_identity(&dir.join("other.txt")),
+        );
+        drop(f);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

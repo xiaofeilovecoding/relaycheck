@@ -8,7 +8,7 @@ use relaycheck::errors::{Code, RelayError, RelayResult};
 use relaycheck::opsman::OpManager;
 use relaycheck::service::Ctx;
 use relaycheck::store::Store;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn main() {
@@ -422,24 +422,20 @@ fn cmd_verify_handoff(args: &[String]) -> i32 {
         eprintln!("package exceeds the size budget; cannot verify safely");
         return 3;
     }
-    let data = match std::fs::File::open(&pkg_path) {
-        Ok(mut f) => {
-            use std::io::Read;
-            let mut buf: Vec<u8> = Vec::new();
-            match f.by_ref().take(max_package + 1).read_to_end(&mut buf) {
-                Ok(_) => {}
-                Err(_) => {
-                    eprintln!("package could not be read; cannot verify safely");
-                    return 3;
-                }
-            }
-            if buf.len() as u64 > max_package {
-                eprintln!("package exceeds the size budget; cannot verify safely");
-                return 3;
-            }
-            buf
+    // The ZIP is read from ONE handle opened with write sharing denied; the
+    // handle itself must resolve to the named path and stay a regular file of
+    // stable size across the bounded read.
+    let data = match open_package_handle(&pkg_path, max_package) {
+        Ok(data) => data,
+        Err(PackageReadError::TooLarge) => {
+            eprintln!("package exceeds the size budget; cannot verify safely");
+            return 3;
         }
-        Err(_) => {
+        Err(PackageReadError::Uncertain) => {
+            eprintln!("package could not be read safely; cannot verify");
+            return 3;
+        }
+        Err(PackageReadError::NotFound) => {
             eprintln!("package file not found or unreadable");
             return 2;
         }
@@ -514,6 +510,87 @@ fn redact_inputs(message: &str, inputs: &[&str]) -> String {
         out = out.replace(&input.replace('\\', "/"), "[input]");
     }
     out
+}
+
+enum PackageReadError {
+    NotFound,
+    TooLarge,
+    Uncertain,
+}
+
+/// Opens the package with write sharing denied, proves the HANDLE resolves to
+/// the named path, and reads the bounded bytes from that same handle with a
+/// size-stability check. A same-size concurrent write makes the read uncertain
+/// (blocked), never trusted.
+fn open_package_handle(pkg_path: &Path, max_package: u64) -> Result<Vec<u8>, PackageReadError> {
+    use std::io::Read;
+    #[cfg(windows)]
+    let f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ only: deny write/delete sharing
+            .open(pkg_path)
+    };
+    #[cfg(not(windows))]
+    let f = std::fs::File::open(pkg_path);
+    let mut f = match f {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PackageReadError::NotFound);
+        }
+        Err(_) => return Err(PackageReadError::Uncertain),
+    };
+    // The handle's own identity must be the named path (Windows final-path by
+    // handle; elsewhere handle-vs-path metadata identity).
+    #[cfg(windows)]
+    match relaycheck::verify_handoff::handle_final_path_public(&f) {
+        Some(resolved) => {
+            let a = relaycheck::verify_handoff::normalize_path_public(Path::new(&resolved));
+            let b = relaycheck::verify_handoff::normalize_path_public(pkg_path);
+            if a != b {
+                return Err(PackageReadError::Uncertain);
+            }
+        }
+        None => return Err(PackageReadError::Uncertain),
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let handle_md = f.metadata().map_err(|_| PackageReadError::Uncertain)?;
+        let path_md = std::fs::metadata(pkg_path).map_err(|_| PackageReadError::Uncertain)?;
+        if handle_md.dev() != path_md.dev() || handle_md.ino() != path_md.ino() {
+            return Err(PackageReadError::Uncertain);
+        }
+    }
+    let md = f.metadata().map_err(|_| PackageReadError::Uncertain)?;
+    if !md.is_file() {
+        return Err(PackageReadError::Uncertain);
+    }
+    let before_len = md.len();
+    if before_len > max_package {
+        return Err(PackageReadError::TooLarge);
+    }
+    let before_modified = md.modified().ok();
+    let mut buf: Vec<u8> = Vec::new();
+    match f.by_ref().take(max_package + 1).read_to_end(&mut buf) {
+        Ok(_) => {}
+        Err(_) => return Err(PackageReadError::Uncertain),
+    }
+    if buf.len() as u64 > max_package {
+        return Err(PackageReadError::TooLarge);
+    }
+    // Stability across the read, from the same handle.
+    let after = f.metadata().map_err(|_| PackageReadError::Uncertain)?;
+    if after.len() != before_len {
+        return Err(PackageReadError::TooLarge);
+    }
+    if let (Some(before), Ok(after_t)) = (before_modified, after.modified()) {
+        if before != after_t {
+            return Err(PackageReadError::Uncertain);
+        }
+    }
+    Ok(buf)
 }
 
 fn cmd_remote_op(args: &[String], kind: &str) -> i32 {

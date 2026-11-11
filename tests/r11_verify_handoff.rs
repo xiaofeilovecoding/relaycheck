@@ -564,3 +564,50 @@ fn r11_bounded_read_input_type_and_no_path_echo() {
     assert!(!stdout.contains(damaged_path.to_str().unwrap()), "no package path echoed");
     let _ = fx.env.cleanup();
 }
+
+#[test]
+fn r11_write_locked_file_blocks_deterministically() {
+    // No race luck: hold a WRITE handle on a listed file; the deny-write
+    // read handle cannot open it and the whole run blocks.
+    let fx = build_fixture("r11n");
+    let home = isolated_home(&fx.env);
+    let lock_target = fx.repo.root.join("docs/plan.md");
+    let guard = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock_target)
+        .expect("open write handle");
+    let err = verify_blocked(&fx.context_pkg, &fx.repo.root, &home);
+    assert_eq!(err.code, Code::EUnverifiedImport);
+    assert!(
+        err.message.contains("read sharing") || err.message.contains("refused"),
+        "write-locked read is blocked: {}",
+        err.message
+    );
+    drop(guard);
+    // releasing the handle restores the clean match
+    let ok = verify_ok(&fx.context_pkg, &fx.repo.root, &home);
+    assert_eq!(ok.result, "match");
+    let _ = fx.env.cleanup();
+}
+
+#[test]
+fn r11_declared_base_head_must_be_commit_shaped() {
+    let fx = build_fixture("r11o");
+    let home = isolated_home(&fx.env);
+    let bad = rebuild_with_receipt(&fx.context_pkg, |r| {
+        r["base_head"] = serde_json::json!("not-a-commit-id");
+    });
+    let err = verify_blocked(&bad, &fx.repo.root, &home);
+    assert!(
+        err.message.contains("base_head"),
+        "malformed declared base_head refused: {}",
+        err.message
+    );
+    // an empty declared base_head stays acceptable (unverified ancestry)
+    let empty = rebuild_with_receipt(&fx.context_pkg, |r| {
+        r["base_head"] = serde_json::json!("");
+    });
+    let out = verify_ok(&empty, &fx.repo.root, &home);
+    assert_eq!(out.base_head_match, None);
+    let _ = fx.env.cleanup();
+}
