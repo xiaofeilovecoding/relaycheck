@@ -402,19 +402,48 @@ fn cmd_verify_handoff(args: &[String]) -> i32 {
         return 2;
     };
     let json_out = find_flag_bool(args, "--json");
-    // Package input: read the named file only. Errors never echo the path.
+    // Package input: bounded read with the SAME frozen budget, enforced
+    // BEFORE the whole file is ever read. Type and size are checked first;
+    // an oversized input is refused without reading it all.
     let pkg_path = std::path::PathBuf::from(&pkg_arg);
-    let data = match std::fs::read(&pkg_path) {
-        Ok(d) => d,
+    let pkg_meta = match std::fs::metadata(&pkg_path) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => {
+            eprintln!("package input is not a regular file");
+            return 2;
+        }
         Err(_) => {
             eprintln!("package file not found or unreadable");
             return 2;
         }
     };
-    if data.len() as i64 > relaycheck::verify_handoff::max_package_bytes() {
+    let max_package = relaycheck::verify_handoff::max_package_bytes() as u64;
+    if pkg_meta.len() > max_package {
         eprintln!("package exceeds the size budget; cannot verify safely");
         return 3;
     }
+    let data = match std::fs::File::open(&pkg_path) {
+        Ok(mut f) => {
+            use std::io::Read;
+            let mut buf: Vec<u8> = Vec::new();
+            match f.by_ref().take(max_package + 1).read_to_end(&mut buf) {
+                Ok(_) => {}
+                Err(_) => {
+                    eprintln!("package could not be read; cannot verify safely");
+                    return 3;
+                }
+            }
+            if buf.len() as u64 > max_package {
+                eprintln!("package exceeds the size budget; cannot verify safely");
+                return 3;
+            }
+            buf
+        }
+        Err(_) => {
+            eprintln!("package file not found or unreadable");
+            return 2;
+        }
+    };
     // Checkout input: strict local absolute path, same boundary as attach.
     let repo_root = match relaycheck::pathsafe::validate_root(&repo_arg) {
         Ok(r) => r,
@@ -450,16 +479,19 @@ fn cmd_verify_handoff(args: &[String]) -> i32 {
             exit
         }
         Err(e) => {
+            // Output must be a safe summary: the user-named paths (and any
+            // underlying io text carrying them) are never echoed.
+            let message = redact_inputs(&e.message, &[&pkg_arg, &repo_arg]);
             if json_out {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "error": {"code": e.code.as_str(), "message": e.message, "details": e.details}
+                        "error": {"code": e.code.as_str(), "message": message, "details": e.details}
                     }))
                     .unwrap_or_default()
                 );
             } else {
-                eprintln!("{}: {}", e.code.as_str(), e.message);
+                eprintln!("{}: {}", e.code.as_str(), message);
             }
             match e.code {
                 Code::EPathBoundary | Code::EValidation | Code::ENotFound => 2,
@@ -467,6 +499,21 @@ fn cmd_verify_handoff(args: &[String]) -> i32 {
             }
         }
     }
+}
+
+/// Removes every occurrence of the raw inputs from a message; also drops any
+/// residual drive-letter or UNC prefix that an underlying io error might carry.
+fn redact_inputs(message: &str, inputs: &[&str]) -> String {
+    let mut out = message.to_string();
+    for input in inputs {
+        if input.is_empty() {
+            continue;
+        }
+        out = out.replace(input, "[input]");
+        out = out.replace(&input.replace('/', "\\"), "[input]");
+        out = out.replace(&input.replace('\\', "/"), "[input]");
+    }
+    out
 }
 
 fn cmd_remote_op(args: &[String], kind: &str) -> i32 {

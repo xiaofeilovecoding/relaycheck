@@ -14,7 +14,6 @@ use relaycheck::errors::Code;
 use relaycheck::service::CaptureRequest;
 use relaycheck::verify_handoff;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 const ISOLATED_HOME_REL: &str = "verify-home";
 
@@ -29,7 +28,6 @@ fn isolated_home(env: &TestEnv) -> PathBuf {
 struct Fixture {
     env: TestEnv,
     repo: common::Repo,
-    task_id: String,
     context_pkg: Vec<u8>,
     portable_pkg: Vec<u8>,
 }
@@ -65,7 +63,7 @@ fn build_fixture(tag: &str) -> Fixture {
     let (_id1, _sha1, context_pkg) = export_handoff(&env, &task_id, "context_only");
     let (_id2, _sha2, portable_pkg) = export_handoff(&env, &task_id, "portable_source");
     let _ = cap;
-    Fixture { env, repo, task_id, context_pkg, portable_pkg }
+    Fixture { env, repo, context_pkg, portable_pkg }
 }
 
 fn verify_ok(pkg: &[u8], repo_root: &Path, home: &Path) -> verify_handoff::VerifyOutcome {
@@ -377,5 +375,192 @@ fn r11_cli_exit_contract() {
     let (code, _) = run(&[std::path::Path::new("verify-handoff"), &pkg, std::path::Path::new("--repo"), std::path::Path::new("relative/checkout")]);
     assert_eq!(code, 2, "relative checkout exits 2");
 
+    let _ = fx.env.cleanup();
+}
+
+// ---- R01/R02 rework: content identity, bounded read, output hygiene ----
+
+/// Rebuilds a zip with a mutated receipt (everything else byte-identical),
+/// keeping the manifest as-is so the identity check can be exercised.
+fn rebuild_with_receipt(original: &[u8], mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let mut receipt: serde_json::Value = {
+        let cur = std::io::Cursor::new(original);
+        let mut z = zip::ZipArchive::new(cur).unwrap();
+        let mut f = z.by_name("receipt.json").unwrap();
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut raw).unwrap();
+        serde_json::from_slice(&raw).unwrap()
+    };
+    mutate(&mut receipt);
+    let manifest_raw: Vec<u8> = {
+        let cur = std::io::Cursor::new(original);
+        let mut z = zip::ZipArchive::new(cur).unwrap();
+        let mut f = z.by_name("manifest.json").unwrap();
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut raw).unwrap();
+        raw
+    };
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        w.start_file("README.md", opts).unwrap();
+        std::io::Write::write_all(&mut w, b"pkg").unwrap();
+        w.start_file("receipt.json", opts).unwrap();
+        std::io::Write::write_all(&mut w, receipt.to_string().as_bytes()).unwrap();
+        w.start_file("manifest.json", opts).unwrap();
+        std::io::Write::write_all(&mut w, &manifest_raw).unwrap();
+        w.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+#[test]
+fn r11_snapshot_identity_mismatch_is_blocked_never_match() {
+    let fx = build_fixture("r11j");
+    let home = isolated_home(&fx.env);
+    let rehashed = rebuild_with_receipt(&fx.context_pkg, |r| {
+        r["snapshot_id"] = serde_json::json!(format!("sha256:{}", "9".repeat(64)));
+    });
+    let err = verify_blocked(&rehashed, &fx.repo.root, &home);
+    assert_eq!(err.code, Code::EUnverifiedImport);
+    assert!(
+        err.message.to_lowercase().contains("snapshot id"),
+        "identity refusal names the mismatch: {}",
+        err.message
+    );
+    // the untouched package still verifies as a match
+    let ok = verify_ok(&fx.context_pkg, &fx.repo.root, &home);
+    assert_eq!(ok.result, "match");
+    let _ = fx.env.cleanup();
+}
+
+#[test]
+fn r11_unknown_scope_and_duplicate_paths_blocked() {
+    let fx = build_fixture("r11k");
+    let home = isolated_home(&fx.env);
+    // rebuild the whole package with a mutated manifest and a matching id so
+    // only the scope/path checks can fire
+    let rebuild_manifest = |scope: &str, files: serde_json::Value| -> Vec<u8> {
+        let cur = std::io::Cursor::new(&fx.context_pkg);
+        let mut z = zip::ZipArchive::new(cur).unwrap();
+        let mut receipt_raw = Vec::new();
+        std::io::Read::read_to_end(
+            &mut z.by_name("receipt.json").unwrap(),
+            &mut receipt_raw,
+        )
+        .unwrap();
+        let mut manifest_raw = Vec::new();
+        std::io::Read::read_to_end(
+            &mut z.by_name("manifest.json").unwrap(),
+            &mut manifest_raw,
+        )
+        .unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&manifest_raw).unwrap();
+        manifest["scope"] = serde_json::json!(scope);
+        manifest["files"] = files;
+        let manifest_sha = relaycheck::canonical::canonical_sha256(&manifest).unwrap();
+        let mut receipt: serde_json::Value = serde_json::from_slice(&receipt_raw).unwrap();
+        receipt["snapshot_id"] = serde_json::json!(format!("sha256:{manifest_sha}"));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("README.md", opts).unwrap();
+            std::io::Write::write_all(&mut w, b"pkg").unwrap();
+            w.start_file("receipt.json", opts).unwrap();
+            std::io::Write::write_all(&mut w, receipt.to_string().as_bytes()).unwrap();
+            w.start_file("manifest.json", opts).unwrap();
+            std::io::Write::write_all(&mut w, manifest.to_string().as_bytes()).unwrap();
+            w.finish().unwrap();
+        }
+        buf.into_inner()
+    };
+    let one_file = serde_json::json!([
+        {"path": "docs/plan.md", "mode": "100644", "size": 1, "sha256": format!("{}", "b".repeat(64))}
+    ]);
+    let unknown_scope = rebuild_manifest("custom-scope", one_file);
+    let err = verify_blocked(&unknown_scope, &fx.repo.root, &home);
+    assert!(err.message.contains("scope"), "unknown scope refused: {}", err.message);
+
+    let duplicated = serde_json::json!([
+        {"path": "docs/plan.md", "mode": "100644", "size": 1, "sha256": format!("{}", "b".repeat(64))},
+        {"path": "docs/plan.md", "mode": "100644", "size": 1, "sha256": format!("{}", "c".repeat(64))}
+    ]);
+    let dup = rebuild_manifest("selected_sources", duplicated);
+    let err = verify_blocked(&dup, &fx.repo.root, &home);
+    assert!(err.message.contains("twice"), "duplicate path refused: {}", err.message);
+    let _ = fx.env.cleanup();
+}
+
+#[test]
+fn r11_sender_claim_ids_render_as_safe_identifiers() {
+    let fx = build_fixture("r11l");
+    let home = isolated_home(&fx.env);
+    let good = rebuild_with_receipt(&fx.context_pkg, |r| {
+        r["claims"] = serde_json::json!([
+            {"kind": "verification", "origin": "exporter_reported",
+             "check_id": "unit pass with spaces", "status": "passed",
+             "snapshot_id": format!("sha256:{}", "a".repeat(64))}
+        ]);
+    });
+    let outcome = verify_ok(&good, &fx.repo.root, &home);
+    assert_eq!(outcome.receipt_claims.len(), 1);
+    assert_eq!(
+        outcome.receipt_claims[0].check_id, "(unprintable-id)",
+        "arbitrary sender text never reaches the output"
+    );
+    assert_eq!(outcome.receipt_claims[0].origin, "exporter_reported");
+    let _ = fx.env.cleanup();
+}
+
+#[test]
+fn r11_bounded_read_input_type_and_no_path_echo() {
+    let fx = build_fixture("r11m");
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_relaycheck"));
+    let repo_arg = fx.repo.root.clone();
+    // oversized package input: refused by metadata before any full read
+    let big = fx.env.scratch.join("big.zip");
+    {
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(relaycheck::verify_handoff::max_package_bytes() as u64 + 1)
+            .unwrap();
+    }
+    let out = std::process::Command::new(&exe)
+        .args(["verify-handoff", big.to_str().unwrap(), "--repo", repo_arg.to_str().unwrap()])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(3), "oversized input exits 3");
+    // a directory as package input is a bad argument (2), not a crash
+    let dir_input = std::process::Command::new(&exe)
+        .args(["verify-handoff", fx.env.scratch.to_str().unwrap(), "--repo", repo_arg.to_str().unwrap()])
+        .output()
+        .expect("spawn");
+    assert_eq!(dir_input.status.code(), Some(2), "non-file package input exits 2");
+    // package validation errors never echo the input paths
+    let mut damaged = fx.context_pkg.clone();
+    let mid = damaged.len() / 2;
+    damaged[mid] ^= 0xa5;
+    let damaged_path = fx.env.scratch.join("damaged2.zip");
+    std::fs::write(&damaged_path, &damaged).unwrap();
+    let out = std::process::Command::new(&exe)
+        .args([
+            "verify-handoff",
+            damaged_path.to_str().unwrap(),
+            "--repo",
+            repo_arg.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !stdout.contains(fx.env.scratch.to_str().unwrap()),
+        "no absolute path echoed: {stdout}"
+    );
+    assert!(!stdout.contains(damaged_path.to_str().unwrap()), "no package path echoed");
     let _ = fx.env.cleanup();
 }

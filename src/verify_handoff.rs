@@ -118,7 +118,10 @@ fn normalize_manifest_path(raw: &str) -> RelayResult<String> {
 }
 
 /// Reads one listed file from the checkout with the confirmed-safe primitives:
-/// lexical boundary check, reparse-point refusal, bounded read.
+/// lexical boundary check, per-level reparse-point refusal down the whole
+/// ancestor chain, one opened handle whose resolution is proven to stay on
+/// the expected path, a bounded read through that handle, and a size
+/// stability check so an input that mutates mid-read can never pass.
 enum ReadOutcome {
     Bytes(Vec<u8>),
     Missing,
@@ -126,6 +129,14 @@ enum ReadOutcome {
     Refused(&'static str),
     /// plain IO failure while reading a regular file
     Unreadable,
+}
+
+/// Normalizes an absolute path for identity comparison: canonical-prefix
+/// stripped, separators unified, case-insensitive on Windows.
+fn normalize_for_identity(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('/', "\\");
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_lowercase();
+    s.trim_end_matches('\\').to_string()
 }
 
 fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
@@ -140,16 +151,37 @@ fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
         Err(_) => return ReadOutcome::Unreadable,
         Ok(_) => {}
     }
-    match pathsafe::is_reparse_point(&joined) {
-        Ok(true) => return ReadOutcome::Refused("target is a link or reparse point"),
-        Ok(false) => {}
-        Err(_) => return ReadOutcome::Refused("target cannot be stat-ed"),
+    // Per-level check: EVERY ancestor directory between the checkout root and
+    // the leaf must be a plain directory — a reparse point anywhere along the
+    // chain could redirect the read outside the checkout.
+    let mut ancestor = joined.clone();
+    loop {
+        match pathsafe::is_reparse_point(&ancestor) {
+            Ok(true) => return ReadOutcome::Refused("path traverses a link or reparse point"),
+            Ok(false) => {}
+            Err(_) => return ReadOutcome::Refused("path cannot be stat-ed"),
+        }
+        match ancestor.parent() {
+            Some(parent) if parent != ancestor => ancestor = parent.to_path_buf(),
+            _ => break,
+        }
     }
+    // Open ONE handle and prove it resolves to the expected path: a handle
+    // opened through a link/alias resolves elsewhere, which canonicalize
+    // exposes. Anything uncertain is refused, never read through.
     let f = match std::fs::File::open(&joined) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
         Err(_) => return ReadOutcome::Unreadable,
     };
+    match std::fs::canonicalize(&joined) {
+        Ok(resolved) => {
+            if normalize_for_identity(&resolved) != normalize_for_identity(&joined) {
+                return ReadOutcome::Refused("read handle resolves off the expected path");
+            }
+        }
+        Err(_) => return ReadOutcome::Refused("read handle cannot be resolved"),
+    }
     let md = match f.metadata() {
         Ok(m) => m,
         Err(_) => return ReadOutcome::Unreadable,
@@ -157,6 +189,7 @@ fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
     if !md.is_file() {
         return ReadOutcome::Refused("target is not a regular file");
     }
+    let before_len = md.len();
     let mut buf = Vec::new();
     let mut handle = f;
     let taken = match handle
@@ -169,6 +202,13 @@ fn read_checked(root_norm: &str, rel: &str) -> ReadOutcome {
     };
     if taken as i64 > MAX_PACKAGE_FILE_BYTES {
         return ReadOutcome::Refused("file exceeds the per-file read limit");
+    }
+    // Stability: the same handle must still report the size it opened with;
+    // a mid-read mutation makes the read uncertain and blocks the run.
+    match handle.metadata() {
+        Ok(after) if after.len() == before_len => {}
+        Ok(_) => return ReadOutcome::Refused("file changed while being read"),
+        Err(_) => return ReadOutcome::Refused("file stability cannot be confirmed"),
     }
     ReadOutcome::Bytes(buf)
 }
@@ -200,11 +240,31 @@ pub fn verify(
         ))
     })?;
 
+    // Content identity: the receipt's snapshot id must equal the SHA-256 of
+    // the canonical manifest actually in the package — a receipt describing a
+    // different manifest can never be verified as a match.
+    let manifest_value = serde_json::to_value(&manifest)
+        .map_err(|_| blocked("manifest is not representable as canonical JSON"))?;
+    let manifest_sha = crate::canonical::canonical_sha256(&manifest_value)
+        .map_err(|_| blocked("manifest cannot be canonicalized"))?;
+    if receipt.snapshot_id != format!("sha256:{manifest_sha}") {
+        return Err(blocked(
+            "receipt snapshot id does not match the canonical manifest digest; package is internally inconsistent",
+        ));
+    }
+    // Frozen scope: only the capture-produced scope is interpretable here.
+    if manifest.scope != "selected_sources" {
+        return Err(blocked("manifest scope is not a recognized capture scope"));
+    }
+
     // Normalize + conflict-check every manifest path before touching disk.
     let mut normalized: Vec<(String, crate::model::ManifestFile)> = Vec::new();
     let mut paths_for_conflict: Vec<String> = Vec::new();
     for f in &manifest.files {
         let rel = normalize_manifest_path(&f.path)?;
+        if normalized.iter().any(|(seen, _)| seen == &rel) {
+            return Err(blocked("manifest lists the same path twice"));
+        }
         paths_for_conflict.push(rel.clone());
         normalized.push((rel, f.clone()));
     }
@@ -312,13 +372,31 @@ pub fn verify(
             .claims
             .iter()
             .map(|c| ClaimView {
-                check_id: c.check_id.clone(),
+                // sender-declared identifiers are rendered only when they are
+                // plain safe identifiers; anything else stays unprintable
+                check_id: safe_identifier(&c.check_id),
                 status: c.status.clone(),
                 snapshot_id: c.snapshot_id.clone(),
                 origin: c.origin.clone(),
             })
             .collect(),
     })
+}
+
+/// Returns the identifier when it is a plain bounded token (letters, digits
+/// and a few separator characters); otherwise a fixed placeholder, so
+/// arbitrary sender text never reaches the output.
+fn safe_identifier(raw: &str) -> String {
+    let ok = !raw.is_empty()
+        && raw.len() <= 64
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@' | '+'));
+    if ok {
+        raw.to_string()
+    } else {
+        "(unprintable-id)".to_string()
+    }
 }
 
 /// Renders the outcome as the human CLI summary. Paths are relative names
