@@ -100,6 +100,58 @@ Schemas: [`schemas/receipt.schema.json`](schemas/receipt.schema.json),
 [`schemas/manifest.schema.json`](schemas/manifest.schema.json). API surface
 and error codes: [`docs/api.md`](docs/api.md).
 
+## Verify before you take over (offline)
+
+A handoff package is data, not an instruction. Before continuing a task with
+it, compare the files it lists against the checkout you were handed, by real
+bytes, size and SHA-256 — offline, without a web session, without unpacking
+the package and without registering anything:
+
+```text
+relaycheck verify-handoff <package.zip> --repo <checkout> [--json]
+```
+
+Exit codes: `0` match, `1` drift, `2` bad arguments, `3` cannot verify safely.
+A real run against a 3-file synthetic package (release build, Windows dev
+machine, ~24 ms per run; repeatable via `tests/r11_verify_handoff.rs`):
+
+```text
+verify-handoff: match
+snapshot sha256:8f7df (context_only), package sha256 aaf21946983b
+base HEAD: matches the declared base
+files: 3 matched, 0 changed, 0 missing, 0 unreadable
+  assets/logo.bin: matched
+  docs/crlf.txt: matched
+  docs/plan.md: matched
+unverified: files present in the checkout but not listed in the manifest are not verified
+unverified: git ancestry (history beyond the working tree) is not verified
+```
+
+Change one byte in `docs/plan.md` and the same command reports the drift and
+exits 1 — the other files stay matched, and the HEAD comparison is reported
+independently of content:
+
+```text
+verify-handoff: drift
+snapshot sha256:8f7df (context_only), package sha256 8de70fb0694d
+base HEAD: matches the declared base
+files: 2 matched, 1 changed, 0 missing, 0 unreadable
+  assets/logo.bin: matched
+  docs/crlf.txt: matched
+  docs/plan.md: changed
+unverified: files present in the checkout but not listed in the manifest are not verified
+unverified: git ancestry (history beyond the working tree) is not verified
+```
+
+The comparison proves only the files the manifest lists: extra checkout files
+and git ancestry stay unverified, an unreadable or unsafe path (traversal,
+drive/ADS form, `.git` metadata, links/reparse points) blocks the whole run
+instead of passing silently, and the sender's `exporter_reported` claims are
+printed separately — never as locally verified results. The web UI's handoff
+preview shows the same one-line reminder. Prebuilt executables come from this
+repository's CI artifacts; `cargo build --release --locked` builds the same
+tool from source.
+
 ## Trust copy
 
 These statements are enforced by the product, not just written here:

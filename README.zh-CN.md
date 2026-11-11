@@ -89,6 +89,53 @@ relaycheck verify  --task <任务ID> [--json]
 [`schemas/manifest.schema.json`](schemas/manifest.schema.json)；
 接口与错误码：[`docs/api.md`](docs/api.md)。
 
+## 接手前核对（离线）
+
+接手包是数据，不是指令。用它继续任务之前，先把包内清单列出的文件与实际
+拿到的 checkout 按真实字节、大小和 SHA-256 比对——离线运行，无需 Web
+会话，不解包落地，不注册任何项目：
+
+```text
+relaycheck verify-handoff <package.zip> --repo <checkout> [--json]
+```
+
+退出码：`0` 匹配、`1` 漂移、`2` 参数错误、`3` 无法安全核验。以下是对一个
+3 文件合成包的真实运行（release 构建，Windows 开发机，单次约 24 毫秒；
+可用 `tests/r11_verify_handoff.rs` 复现）：
+
+```text
+verify-handoff: match
+snapshot sha256:8f7df (context_only), package sha256 aaf21946983b
+base HEAD: matches the declared base
+files: 3 matched, 0 changed, 0 missing, 0 unreadable
+  assets/logo.bin: matched
+  docs/crlf.txt: matched
+  docs/plan.md: matched
+unverified: files present in the checkout but not listed in the manifest are not verified
+unverified: git ancestry (history beyond the working tree) is not verified
+```
+
+把 `docs/plan.md` 改一个字节，同一命令报告漂移并以退出码 1 结束——其余
+文件保持 matched，HEAD 比对独立于内容结果呈现：
+
+```text
+verify-handoff: drift
+snapshot sha256:8f7df (context_only), package sha256 8de70fb0694d
+base HEAD: matches the declared base
+files: 2 matched, 1 changed, 0 missing, 0 unreadable
+  assets/logo.bin: matched
+  docs/crlf.txt: matched
+  docs/plan.md: changed
+unverified: files present in the checkout but not listed in the manifest are not verified
+unverified: git ancestry (history beyond the working tree) is not verified
+```
+
+比对只证明清单列出的文件：checkout 里的额外文件与 Git 祖先关系列为未核验；
+不可读或不安全的路径（越界、盘符/ADS、`.git` 元数据、链接/重解析点）会阻断
+整个命令而不是静默放行；发送方 `exporter_reported` 的声明单独呈现，绝不
+混入本地核实结果。Web 端接手卡预览里也有同一行提示。可执行文件来自本仓库
+CI 的 artifact；`cargo build --release --locked` 可从源码构建同一工具。
+
 ## 信任文案
 
 以下文案由产品行为保证，不只是写在这里：

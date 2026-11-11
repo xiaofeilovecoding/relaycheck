@@ -15,6 +15,7 @@ pub mod secrets;
 pub mod checks;
 pub mod handoff;
 pub mod zipx;
+pub mod verify_handoff;
 pub mod service;
 pub mod opsman;
 pub mod http;

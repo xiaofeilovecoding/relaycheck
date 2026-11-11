@@ -851,6 +851,10 @@ function HandoffModal({
             {t.handoffTitle} · {t.handoffSchema}
           </div>
           <div className="handoff-preview" data-testid="handoff-preview">{preview}</div>
+          <p className="small-note" data-testid="verify-handoff-hint">
+            {lang === "zh" ? "接手前核对：" : "Before taking over, verify: "}
+            <code>relaycheck verify-handoff &lt;package.zip&gt; --repo &lt;checkout&gt;</code>
+          </p>
           <p className="small-note">{t.exported}</p>
         </>
       ) : (

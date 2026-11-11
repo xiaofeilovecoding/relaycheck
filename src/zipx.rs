@@ -17,7 +17,7 @@ use crate::model::{
     MAX_PACKAGE_ENTRIES, MAX_PACKAGE_EXPANDED_BYTES, MAX_PACKAGE_FILE_BYTES,
 };
 use crate::pathsafe;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 pub const PKG_README: &str = include_str!("../assets/package-readme.md");
@@ -212,23 +212,16 @@ pub fn validate_entry_name(name: &str) -> RelayResult<()> {
     Ok(())
 }
 
-/// Reads and validates a package from bytes. On success the package is
-/// unpacked into `quarantine_root/import-<id>` — never into any repo.
-pub fn unpack_package(
-    data: &[u8],
-    quarantine_root: &Path,
-) -> RelayResult<ValidatedPackage> {
-    if data.len() as i64 > MAX_PACKAGE_EXPANDED_BYTES {
-        return Err(RelayError::new(Code::ELimit, "package file too large"));
-    }
-    let reader = std::io::Cursor::new(data);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| RelayError::new(Code::EUnverifiedImport, format!("not a readable zip: {e}")))?;
+/// Shared read-only entry collection for both the import path and the
+/// offline inspect/verify path: per-entry name validation, case-conflict
+/// detection, symlink flagging, declared-size match and size budgets.
+/// Nothing is written to disk here.
+fn collect_entries<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> RelayResult<Vec<(String, Vec<u8>, bool)>> {
     if archive.len() > MAX_PACKAGE_ENTRIES {
         return Err(RelayError::new(Code::ELimit, "package has too many entries"));
     }
-
-    // First pass: names + duplicates + read bounded data.
     let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut entries: Vec<(String, Vec<u8>, bool)> = Vec::new(); // (name, data, is_symlink)
     let mut expanded_total: i64 = 0;
@@ -268,6 +261,22 @@ pub fn unpack_package(
         }
         entries.push((name, buf, is_symlink));
     }
+    Ok(entries)
+}
+
+/// Reads and validates a package from bytes. On success the package is
+/// unpacked into `quarantine_root/import-<id>` — never into any repo.
+pub fn unpack_package(
+    data: &[u8],
+    quarantine_root: &Path,
+) -> RelayResult<ValidatedPackage> {
+    if data.len() as i64 > MAX_PACKAGE_EXPANDED_BYTES {
+        return Err(RelayError::new(Code::ELimit, "package file too large"));
+    }
+    let reader = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| RelayError::new(Code::EUnverifiedImport, format!("not a readable zip: {e}")))?;
+    let entries = collect_entries(&mut archive)?;
 
     // RC03: EVERY entry is secret-scanned before anything is parsed,
     // persisted or shown — a receipt/markdown/manifest/source carrying
@@ -363,25 +372,58 @@ fn cleanup(dir: &Path) {
     std::fs::remove_dir_all(dir).ok();
 }
 
-/// Reads a validated package's receipt without unpacking anything else
-/// (inspect path: read-only, structure/hash/scope verification only).
+/// Read-only package inspection with the SAME entry and identity validation
+/// as the import path (R02: shared ZIP entry + identity checks), minus the
+/// secret scan, quarantine unpack and activation. For portable_source
+/// packages every manifest blob is additionally verified present, size-true
+/// and hash-true. Nothing is extracted; nothing is registered; no Git or DB
+/// writes.
 pub fn inspect_package(data: &[u8]) -> RelayResult<(Receipt, SnapshotManifest)> {
+    if data.len() as i64 > MAX_PACKAGE_EXPANDED_BYTES {
+        return Err(RelayError::new(Code::ELimit, "package file too large"));
+    }
     let reader = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| RelayError::new(Code::EUnverifiedImport, format!("not a readable zip: {e}")))?;
-    let mut read_entry = |name: &str| -> RelayResult<Vec<u8>> {
-        let mut f = archive
-            .by_name(name)
-            .map_err(|_| RelayError::new(Code::EUnverifiedImport, format!("missing {name}")))?;
-        if f.size() as i64 > 16 * 1024 * 1024 {
-            return Err(RelayError::new(Code::ELimit, "entry too large to inspect"));
+    let entries = collect_entries(&mut archive)?;
+    for (name, _, is_symlink) in &entries {
+        if *is_symlink {
+            return Err(RelayError::new(Code::EUnverifiedImport, "symlink zip entries are rejected"));
         }
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).map_err(|e| RelayError::new(Code::EUnverifiedImport, format!("read {name}: {e}")))?;
-        Ok(buf)
+        let _ = name;
+    }
+    let read_entry = |name: &str| -> RelayResult<Vec<u8>> {
+        entries
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, d, _)| d.clone())
+            .ok_or_else(|| RelayError::new(Code::EUnverifiedImport, format!("missing {name}")))
     };
     let receipt = parse_receipt(&read_entry("receipt.json")?)?;
     let manifest = parse_manifest(&read_entry("manifest.json")?)?;
+    if manifest.schema_version != crate::model::SNAPSHOT_SCHEMA_VERSION {
+        return Err(RelayError::new(Code::EUnverifiedImport, "unsupported manifest version"));
+    }
+    // Portable-source: every manifest blob must be present and hash-true —
+    // the package content hash binds content, so a damaged blob cannot pass
+    // a content comparison against the manifest.
+    if receipt.source_mode == "portable_source" {
+        for f in &manifest.files {
+            let name = format!("blobs/{}", f.sha256);
+            let data = read_entry(&name).map_err(|_| {
+                RelayError::new(
+                    Code::EUnverifiedImport,
+                    format!("portable package is missing blob {}", &f.sha256[..12.min(f.sha256.len())]),
+                )
+            })?;
+            if data.len() as i64 != f.size || crate::ids::sha256_hex(&data) != f.sha256 {
+                return Err(RelayError::new(
+                    Code::EUnverifiedImport,
+                    "packaged blob does not match its manifest hash",
+                ));
+            }
+        }
+    }
     Ok((receipt, manifest))
 }
 

@@ -44,8 +44,10 @@ fn print_usage() -> i32 {
          relaycheck attach <repo-path>\n      register a Git project; prints a one-time claim code for the browser\n  \
          relaycheck tasks\n      list registered projects and tasks (JSON)\n  \
          relaycheck capture --task <id> [--untracked a,b] [--exclude a,b] [--json]\n      capture a candidate snapshot (waits)\n  \
-         relaycheck verify --task <id> [--json]\n      run the task's approved checks (waits)\n\n\
-         Exit codes: 0 ok, 1 check failure, 2 bad args, 3 blocked/conflict, 4 internal, 5 stop unknown.",
+         relaycheck verify --task <id> [--json]\n      run the task's approved checks (waits)\n  \
+         relaycheck verify-handoff <package.zip> --repo <checkout> [--json]\n      offline: compare the package's listed files with the checkout (match/drift/blocked)\n\n\
+         Exit codes: 0 ok, 1 check failure, 2 bad args, 3 blocked/conflict, 4 internal, 5 stop unknown.\n\
+         verify-handoff exits: 0 match, 1 drift, 2 bad args, 3 cannot verify safely.",
         env!("CARGO_PKG_VERSION")
     );
     2
@@ -58,6 +60,7 @@ fn run(args: &[String]) -> i32 {
         Some("tasks") => cmd_tasks(args),
         Some("capture") => cmd_remote_op(args, "capture"),
         Some("verify") => cmd_remote_op(args, "verify"),
+        Some("verify-handoff") => cmd_verify_handoff(args),
         Some("--help") | Some("-h") | Some("help") | None => print_usage(),
         Some(other) => {
             eprintln!("unknown command: {other}");
@@ -381,6 +384,87 @@ fn cmd_tasks(args: &[String]) -> i32 {
         Err(e) => {
             eprintln!("{}: {}", e.code.as_str(), e.message);
             e.code.cli_exit()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// verify-handoff (offline; no service, no unpack, no registration)
+// ---------------------------------------------------------------------------
+
+fn cmd_verify_handoff(args: &[String]) -> i32 {
+    let Some(pkg_arg) = args.iter().nth(1).filter(|a| !a.starts_with("--")).cloned() else {
+        eprintln!("usage: relaycheck verify-handoff <package.zip> --repo <checkout> [--json]");
+        return 2;
+    };
+    let Some(repo_arg) = find_flag(args, "--repo") else {
+        eprintln!("verify-handoff needs the checkout to compare against: --repo <checkout>");
+        return 2;
+    };
+    let json_out = find_flag_bool(args, "--json");
+    // Package input: read the named file only. Errors never echo the path.
+    let pkg_path = std::path::PathBuf::from(&pkg_arg);
+    let data = match std::fs::read(&pkg_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("package file not found or unreadable");
+            return 2;
+        }
+    };
+    if data.len() as i64 > relaycheck::verify_handoff::max_package_bytes() {
+        eprintln!("package exceeds the size budget; cannot verify safely");
+        return 3;
+    }
+    // Checkout input: strict local absolute path, same boundary as attach.
+    let repo_root = match relaycheck::pathsafe::validate_root(&repo_arg) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{}: {}", e.code.as_str(), e.message);
+            return 2;
+        }
+    };
+    // Isolated git home (empty hooks dir) outside any repo or data dir.
+    let home_base = std::env::temp_dir().join("relaycheck-verify-handoff");
+    let isolated_home = match relaycheck::gitx::isolated_home(&home_base) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("could not prepare the isolated git home; cannot verify safely");
+            return 3;
+        }
+    };
+    match relaycheck::verify_handoff::verify(&data, &repo_root, &isolated_home) {
+        Ok(outcome) => {
+            let exit = match outcome.result.as_str() {
+                "match" => 0,
+                "drift" => 1,
+                _ => 3,
+            };
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                print!("{}", relaycheck::verify_handoff::render_summary(&outcome));
+            }
+            exit
+        }
+        Err(e) => {
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "error": {"code": e.code.as_str(), "message": e.message, "details": e.details}
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("{}: {}", e.code.as_str(), e.message);
+            }
+            match e.code {
+                Code::EPathBoundary | Code::EValidation | Code::ENotFound => 2,
+                _ => 3,
+            }
         }
     }
 }
