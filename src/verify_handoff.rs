@@ -570,6 +570,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn handle_final_path_vouches_the_opened_file() {
         // deterministic positive: the handle of a really-opened file resolves
