@@ -286,6 +286,16 @@ def main():
         o = overflow(page)
         record("no-horizontal-overflow-zoom200-half-viewport", o["sw"] <= o["cw"], str(o))
 
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.locator(".nav-item").nth(1).click()
+        search = page.locator(".inbox-search")
+        search.fill("no-such-handoff-test")
+        record("mobile-filter-empty", page.locator(".task-card").count() == 0)
+        search.fill("")
+        page.locator(".task-card").first.click()
+        page.locator(".detail-top .mobile-only").click()
+        record("mobile-return-to-tasks", page.locator(".task-card").first.is_visible())
+
         browser.close()
 
     ok_all = all(a["ok"] for a in results["assertions"]) and not results["page_errors"] and not results["external_requests"]

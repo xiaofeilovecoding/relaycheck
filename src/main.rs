@@ -109,11 +109,12 @@ fn serve_inner(data_dir: PathBuf, port_override: Option<u16>) -> RelayResult<()>
                 .write(true)
                 .share_mode(0)
                 .open(&lock_path)
-                .map_err(|_| {
-                    RelayError::new(
+                .map_err(|err| match err.raw_os_error() {
+                    Some(32 | 33) => RelayError::new(
                         Code::ELimit,
                         "RelayCheck is already running (single-instance lock held)",
-                    )
+                    ),
+                    _ => RelayError::internal(format!("cannot open the instance lock: {err}")),
                 })?
         }
         #[cfg(not(windows))]

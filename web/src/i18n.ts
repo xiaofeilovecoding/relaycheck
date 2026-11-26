@@ -6,6 +6,8 @@ export type Lang = "zh" | "en";
 
 const zh = {
   handoffs: "接力",
+  taskSearch: "搜索目标或项目",
+  noMatches: "没有匹配的任务",
   tasks: "任务",
   settings: "设置",
   localNote: "保存在此电脑",
@@ -157,6 +159,8 @@ const zh = {
 
 const en: typeof zh = {
   handoffs: "Handoffs",
+  taskSearch: "Search goals or projects",
+  noMatches: "No matching tasks",
   tasks: "Tasks",
   settings: "Settings",
   localNote: "On this computer",
