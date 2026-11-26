@@ -102,6 +102,11 @@ code, .code {
 /* ---- task list ---- */
 
 .inbox { border-right: 1px solid var(--line); padding: 28px 14px; background: var(--surface); min-width: 0; }
+.inbox-heading { display: flex; gap: 12px; align-items: baseline; justify-content: space-between; }
+.inbox-count { color: var(--muted); font: 12px/1.5 var(--font-code); }
+.inbox-search { width: 100%; min-width: 0; padding: 9px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-input); background: var(--raised); }
+.task-card strong { display: block; overflow-wrap: anywhere; }
+.task-card:hover { background: var(--raised); border-color: var(--line); }
 .inbox h2 { font-size: 16px; margin: 0 8px 6px; }
 .sub { color: var(--muted); font-size: 13px; line-height: 20px; }
 .inbox > .sub { margin: 0 8px 20px; }
@@ -289,7 +294,11 @@ details.activity ul { margin: 8px 0 0; padding-left: 18px; }
 
 @media (max-width: 1100px) {
   .app { grid-template-columns: 180px minmax(0, 1fr); }
+  .sidebar { grid-row: 1 / 3; }
   .inbox { display: none; }
+  .app[data-inbox-open="true"] .inbox { display: block; border: 0; border-bottom: 1px solid var(--line); }
+  main.detail { grid-column: 2; }
+  .mobile-only { display: inline !important; }
   main.detail { padding: 24px; }
   .split { grid-template-columns: minmax(0, 1.3fr) minmax(240px, 0.85fr); }
 }

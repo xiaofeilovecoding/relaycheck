@@ -35,6 +35,7 @@ export function App() {
     view: "handoffs",
     taskId: null,
   });
+  const [filter, setFilter] = useState("");
   const eventsHead = useRef(0);
   const [detailTick, setDetailTick] = useState(0);
   const t = dict[lang];
@@ -225,10 +226,14 @@ export function App() {
       </button>
     ));
 
-  const visibleTasks = route.view === "tasks" ? tasks : tasks;
+  const query = filter.trim().toLowerCase();
+  const visibleTasks = tasks.filter((task) =>
+    [task.goal, task.project_name].some((value) => value?.toLowerCase().includes(query)),
+  );
+  const showCompactInbox = !selected && route.view !== "settings" && (tasks.length > 0 || state?.projects?.length > 0);
 
   return (
-    <div className="app">
+    <div className="app" data-inbox-open={showCompactInbox}>
       <aside className="sidebar">
         <div className="brand">
           <BuckleMark className="mark" />
@@ -242,9 +247,17 @@ export function App() {
       </aside>
 
       <section className="inbox">
-        <h2>{route.view === "tasks" ? t.tasks : t.handoffs}</h2>
+        <header className="inbox-heading">
+          <h2>{route.view === "tasks" ? t.tasks : t.handoffs}</h2>
+          <span className="inbox-count">{visibleTasks.length} / {tasks.length}</span>
+        </header>
         <p className="sub">{t.inboxSub}</p>
-        {visibleTasks.length === 0 ? null : listItems(visibleTasks)}
+        {tasks.length > 0 && (
+          <input className="inbox-search" type="search" aria-label={t.taskSearch}
+            placeholder={t.taskSearch} value={filter} onChange={(e) => setFilter(e.target.value)} />
+        )}
+        {query && visibleTasks.length === 0 && <p className="sub" role="status">{t.noMatches}</p>}
+        {listItems(visibleTasks)}
         <NewTaskInline
           t={t}
           lang={lang}
@@ -252,6 +265,7 @@ export function App() {
           onDemo={createDemo}
           onCreated={async (taskId) => {
             await refresh();
+            setFilter("");
             setRoute({ view: route.view, taskId });
           }}
         />
@@ -260,12 +274,12 @@ export function App() {
       <main className="detail">
         <div className="detail-top">
           <div className="sub">
-            <button
+            {selected && <button
               className="link-btn mobile-only"
               onClick={() => setRoute({ view: route.view, taskId: null })}
             >
               ‹ {t.back}
-            </button>
+            </button>}
             {t.breadcrumb}
           </div>
           <div className="controls">
